@@ -61,7 +61,7 @@ internal class OracleBulkInsertProvider(ILogger<OracleBulkInsertProvider>? logge
 
         // When tableName is the SQL-quoted fully qualified name (direct insert path), use the
         // unquoted plain table name so ODP.NET does not apply double schema qualification
-        // (e.g. OU_RICO.OU_RICO.TABLE_NAME) when a default schema is configured via HasDefaultSchema.
+        // (e.g. SchemaX.SchemaX.TABLE_NAME) when a default schema is configured via HasDefaultSchema.
         var destinationTableName = tableName == tableInfo.QuotedTableName
             ? tableInfo.TableName
             : tableName;
