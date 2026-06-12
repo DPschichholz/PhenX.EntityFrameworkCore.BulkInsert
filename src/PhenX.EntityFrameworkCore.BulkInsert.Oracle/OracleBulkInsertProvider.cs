@@ -1,14 +1,11 @@
-using System.Data;
 using System.Runtime.CompilerServices;
 
 using JetBrains.Annotations;
 
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
 using Oracle.ManagedDataAccess.Client;
-using Oracle.ManagedDataAccess.Types;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Extensions;
 using PhenX.EntityFrameworkCore.BulkInsert.Metadata;
@@ -37,6 +34,9 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         BatchSize = 50_000,
     };
 
+    // Column added to the temp table to store the ROWID of the corresponding inserted target row.
+    private const string TargetRowIdColumn = "_target_rowid";
+
     /// <inheritdoc />
     protected override async IAsyncEnumerable<T> BulkInsertReturnEntities<T>(
         bool sync,
@@ -61,12 +61,63 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         try
         {
             var tempTableName = await CreateTableCopyAsync<T>(sync, context, options, tableInfo, ctk);
-            string[] rowids;
             try
             {
+                // Extend the temp table with a column that will hold the ROWID of the
+                // corresponding row inserted into the target table.
+                var quotedRowIdCol = SqlDialect.Quote(TargetRowIdColumn);
+                await ExecuteAsync(sync, context, $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} VARCHAR2(18))", ctk);
+
                 var columns = tableInfo.GetColumns(options.CopyGeneratedColumns);
                 await BulkInsert(sync, context, tableInfo, entities, tempTableName, columns, options, ctk);
-                rowids = await InsertFromTempAndCollectRowIds(sync, context, tableInfo, tempTableName, columns, ctk);
+
+                // Insert from temp into target and write the resulting target ROWIDs back into
+                // the temp table row-by-row using FORALL.
+                //
+                // Approach:
+                //   1. Snapshot the temp ROWIDs in ORDER BY ROWID order.
+                //   2. INSERT ... ORDER BY ROWID with RETURNING ROWID BULK COLLECT – Oracle
+                //      guarantees that the i-th returned target ROWID corresponds to the i-th
+                //      source row in the same ORDER BY sequence.
+                //   3. FORALL i: UPDATE temp WHERE ROWID = v_temp_rowids(i)
+                //      -> stores the target ROWID into the matching temp row.
+                var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
+                var plsql = $"""
+                             DECLARE
+                               TYPE t_temp_rowid_t   IS TABLE OF ROWID     INDEX BY PLS_INTEGER;
+                               TYPE t_target_rowid_t IS TABLE OF VARCHAR2(18) INDEX BY PLS_INTEGER;
+                               v_temp_rowids   t_temp_rowid_t;
+                               v_target_rowids t_target_rowid_t;
+                             BEGIN
+                               SELECT ROWID BULK COLLECT INTO v_temp_rowids
+                               FROM {tempTableName} ORDER BY ROWID;
+
+                               INSERT INTO {tableInfo.QuotedTableName} ({colList})
+                               SELECT {colList} FROM {tempTableName} ORDER BY ROWID
+                               RETURNING ROWIDTOCHAR(ROWID) BULK COLLECT INTO v_target_rowids;
+
+                               FORALL i IN 1..v_target_rowids.COUNT
+                                 UPDATE {tempTableName}
+                                 SET {quotedRowIdCol} = v_target_rowids(i)
+                                 WHERE ROWID = v_temp_rowids(i);
+                             END;
+                             """;
+                await ExecuteAsync(sync, context, plsql, ctk);
+
+                // Retrieve inserted target rows via the ROWIDs stored in the temp table.
+                // A single subquery replaces batched IN-clause queries and avoids false positives
+                // from pre-existing rows that happen to share the same column values.
+                var selectSql = $"""
+                                 SELECT t.* FROM {tableInfo.QuotedTableName} t
+                                 WHERE ROWID IN (
+                                   SELECT CHARTOROWID({quotedRowIdCol}) FROM {tempTableName}
+                                   WHERE {quotedRowIdCol} IS NOT NULL
+                                 )
+                                 """;
+                await foreach (var item in context.Set<T>().FromSqlRaw(selectSql).AsAsyncEnumerable().WithCancellation(ctk))
+                {
+                    yield return item;
+                }
             }
             finally
             {
@@ -80,93 +131,12 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
                 }
             }
 
-            const int rowidBatchSize = 1000;
-            for (var i = 0; i < rowids.Length; i += rowidBatchSize)
-            {
-                var inClause = string.Join(", ", rowids.Skip(i).Take(rowidBatchSize).Select(r => $"'{r}'"));
-                var sql = $"SELECT * FROM {tableInfo.QuotedTableName} WHERE ROWID IN ({inClause})";
-                await foreach (var item in context.Set<T>().FromSqlRaw(sql).AsAsyncEnumerable().WithCancellation(ctk))
-                {
-                    yield return item;
-                }
-            }
-
             await connection.Commit(sync, ctk);
         }
         finally
         {
             await connection.Close(sync, ctk);
         }
-    }
-
-    private async Task<string[]> InsertFromTempAndCollectRowIds(
-        bool sync,
-        DbContext context,
-        TableMetadata tableInfo,
-        string tempTableName,
-        IReadOnlyList<ColumnMetadata> columns,
-        CancellationToken ctk)
-    {
-        await using var countCmd = context.Database.GetDbConnection().CreateCommand();
-        countCmd.Transaction = context.Database.CurrentTransaction!.GetDbTransaction();
-        countCmd.CommandText = $"SELECT COUNT(*) FROM {tempTableName}";
-
-        int rowCount;
-        if (sync)
-        {
-            rowCount = Convert.ToInt32(countCmd.ExecuteScalar());
-        }
-        else
-        {
-            rowCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ctk));
-        }
-
-        if (rowCount == 0)
-        {
-            return [];
-        }
-
-        var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
-        var plsql = $"""
-                     DECLARE
-                       TYPE t_rowid_list IS TABLE OF VARCHAR2(18) INDEX BY PLS_INTEGER;
-                       v_rowids t_rowid_list;
-                     BEGIN
-                       INSERT INTO {tableInfo.QuotedTableName} ({colList})
-                       SELECT {colList} FROM {tempTableName}
-                       RETURNING ROWID BULK COLLECT INTO v_rowids;
-                       :out_rowids := v_rowids;
-                     END;
-                     """;
-
-        await using var cmd = (OracleCommand)context.Database.GetDbConnection().CreateCommand();
-        cmd.Transaction = (OracleTransaction)context.Database.CurrentTransaction!.GetDbTransaction();
-        cmd.CommandText = plsql;
-
-        var rowidParam = new OracleParameter
-        {
-            ParameterName = "out_rowids",
-            OracleDbType = OracleDbType.Varchar2,
-            Direction = ParameterDirection.Output,
-            CollectionType = OracleCollectionType.PLSQLAssociativeArray,
-            Size = rowCount,
-            ArrayBindSize = Enumerable.Repeat(18, rowCount).ToArray(),
-        };
-        cmd.Parameters.Add(rowidParam);
-
-        if (sync)
-        {
-            cmd.ExecuteNonQuery();
-        }
-        else
-        {
-            await cmd.ExecuteNonQueryAsync(ctk);
-        }
-
-        return ((OracleString[])rowidParam.Value)
-            .Where(r => !r.IsNull)
-            .Select(r => r.Value)
-            .ToArray();
     }
 
     /// <inheritdoc />
