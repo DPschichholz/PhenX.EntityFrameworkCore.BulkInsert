@@ -66,7 +66,7 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
                 // Extend the temp table with a column that will hold the ROWID of the
                 // corresponding row inserted into the target table.
                 var quotedRowIdCol = SqlDialect.Quote(TargetRowIdColumn);
-                await ExecuteAsync(sync, context, $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} VARCHAR2(18))", ctk);
+                await ExecuteAsync(sync, context, $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} ROWID)", ctk);
 
                 var columns = tableInfo.GetColumns(options.CopyGeneratedColumns);
                 await BulkInsert(sync, context, tableInfo, entities, tempTableName, columns, options, ctk);
@@ -84,8 +84,8 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
                 var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
                 var plsql = $"""
                              DECLARE
-                               TYPE t_temp_rowid_t   IS TABLE OF ROWID     INDEX BY PLS_INTEGER;
-                               TYPE t_target_rowid_t IS TABLE OF VARCHAR2(18) INDEX BY PLS_INTEGER;
+                               TYPE t_temp_rowid_t   IS TABLE OF ROWID INDEX BY PLS_INTEGER;
+                               TYPE t_target_rowid_t IS TABLE OF ROWID INDEX BY PLS_INTEGER;
                                v_temp_rowids   t_temp_rowid_t;
                                v_target_rowids t_target_rowid_t;
                              BEGIN
@@ -94,7 +94,7 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
 
                                INSERT INTO {tableInfo.QuotedTableName} ({colList})
                                SELECT {colList} FROM {tempTableName} ORDER BY ROWID
-                               RETURNING ROWIDTOCHAR(ROWID) BULK COLLECT INTO v_target_rowids;
+                               RETURNING ROWID BULK COLLECT INTO v_target_rowids;
 
                                FORALL i IN 1..v_target_rowids.COUNT
                                  UPDATE {tempTableName}
@@ -110,7 +110,7 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
                 var selectSql = $"""
                                  SELECT t.* FROM {tableInfo.QuotedTableName} t
                                  WHERE ROWID IN (
-                                   SELECT CHARTOROWID({quotedRowIdCol}) FROM {tempTableName}
+                                   SELECT {quotedRowIdCol} FROM {tempTableName}
                                    WHERE {quotedRowIdCol} IS NOT NULL
                                  )
                                  """;
