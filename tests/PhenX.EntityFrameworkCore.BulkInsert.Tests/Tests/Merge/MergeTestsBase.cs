@@ -128,8 +128,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_SingleColumn(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run,Name = $"{_run}_Entity1" });
@@ -243,8 +241,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_ExpressionCondition(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -288,8 +284,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_ComplexExpressionCondition(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -322,8 +316,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_MultipleColumns(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -355,8 +347,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithComplexType_UpdateAll(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         var entities = new List<TestEntityWithComplexType>
@@ -409,8 +399,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithComplexType_UpdateWithWhere(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange - initial Code values are 10 and 20
         var entities = new List<TestEntityWithComplexType>
@@ -462,8 +450,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithComplexType_UpdateComplexPropertyConditionally(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange - Create entities with different Code values
         var entities = new List<TestEntityWithComplexType>

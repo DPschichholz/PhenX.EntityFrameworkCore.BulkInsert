@@ -34,8 +34,12 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         BatchSize = 50_000,
     };
 
-    // Column added to the temp table to store the ROWID of the corresponding inserted target row.
+    // Column added to the temp table to store the ROWID of the corresponding inserted/updated target row.
     private const string TargetRowIdColumn = "_target_rowid";
+
+    // Column added to the temp table (only for UPSERT) to mark rows that matched an existing target row.
+    // Distinguishes "not matched → INSERT" from "matched but WHERE=false → DoNothing (skip INSERT)".
+    private const string IsMatchedColumn = "_is_matched";
 
     /// <inheritdoc />
     protected override async IAsyncEnumerable<T> BulkInsertReturnEntities<T>(
@@ -47,12 +51,6 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         OnConflictOptions<T>? onConflict,
         [EnumeratorCancellation] CancellationToken ctk) where T : class
     {
-        if (onConflict != null)
-        {
-            throw new NotSupportedException(
-                "Oracle MERGE does not support returning entities. Use ExecuteBulkInsertAsync without returning results when using conflict resolution.");
-        }
-
         using var activity = Telemetry.ActivitySource.StartActivity("BulkInsertReturnEntities");
         activity?.AddTag("tableName", tableInfo.TableName);
         activity?.AddTag("synchronous", sync);
@@ -64,49 +62,26 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
             try
             {
                 // Extend the temp table with a column that will hold the ROWID of the
-                // corresponding row inserted into the target table.
+                // corresponding row inserted/updated in the target table.
+                // For UPSERT, also add _is_matched so Phase 3 can skip re-inserting matched rows.
                 var quotedRowIdCol = SqlDialect.Quote(TargetRowIdColumn);
-                await ExecuteAsync(sync, context, $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} ROWID)", ctk);
+                var alterSql = onConflict != null
+                    ? $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} ROWID, {SqlDialect.Quote(IsMatchedColumn)} NUMBER(1))"
+                    : $"ALTER TABLE {tempTableName} ADD ({quotedRowIdCol} ROWID)";
+                await ExecuteAsync(sync, context, alterSql, ctk);
 
                 var columns = tableInfo.GetColumns(options.CopyGeneratedColumns);
                 await BulkInsert(sync, context, tableInfo, entities, tempTableName, columns, options, ctk);
 
-                // Insert from temp into target and write the resulting target ROWIDs back into
-                // the temp table row-by-row using FORALL.
-                //
-                // Approach:
-                //   1. Snapshot the temp ROWIDs in ORDER BY ROWID order.
-                //   2. INSERT ... ORDER BY ROWID with RETURNING ROWID BULK COLLECT – Oracle
-                //      guarantees that the i-th returned target ROWID corresponds to the i-th
-                //      source row in the same ORDER BY sequence.
-                //   3. FORALL i: UPDATE temp WHERE ROWID = v_temp_rowids(i)
-                //      -> stores the target ROWID into the matching temp row.
-                var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
-                var plsql = $"""
-                             DECLARE
-                               TYPE t_temp_rowid_t   IS TABLE OF ROWID INDEX BY PLS_INTEGER;
-                               TYPE t_target_rowid_t IS TABLE OF ROWID INDEX BY PLS_INTEGER;
-                               v_temp_rowids   t_temp_rowid_t;
-                               v_target_rowids t_target_rowid_t;
-                             BEGIN
-                               SELECT ROWID BULK COLLECT INTO v_temp_rowids
-                               FROM {tempTableName} ORDER BY ROWID;
-
-                               INSERT INTO {tableInfo.QuotedTableName} ({colList})
-                               SELECT {colList} FROM {tempTableName} ORDER BY ROWID
-                               RETURNING ROWID BULK COLLECT INTO v_target_rowids;
-
-                               FORALL i IN 1..v_target_rowids.COUNT
-                                 UPDATE {tempTableName}
-                                 SET {quotedRowIdCol} = v_target_rowids(i)
-                                 WHERE ROWID = v_temp_rowids(i);
-                             END;
-                             """;
+                var plsql = onConflict == null
+                    ? BuildInsertReturnPLSQL(tableInfo, tempTableName, quotedRowIdCol, columns)
+                    : SqlDialect.BuildUpsertReturnPLSQL(
+                        context, tableInfo, tempTableName,
+                        quotedRowIdCol, SqlDialect.Quote(IsMatchedColumn),
+                        columns, onConflict);
                 await ExecuteAsync(sync, context, plsql, ctk);
 
-                // Retrieve inserted target rows via the ROWIDs stored in the temp table.
-                // A single subquery replaces batched IN-clause queries and avoids false positives
-                // from pre-existing rows that happen to share the same column values.
+                // Retrieve all affected rows (inserted or updated) via their ROWIDs stored in the temp table.
                 var selectSql = $"""
                                  SELECT t.* FROM {tableInfo.QuotedTableName} t
                                  WHERE ROWID IN (
@@ -137,6 +112,37 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         {
             await connection.Close(sync, ctk);
         }
+    }
+
+    // Builds the PL/SQL block for plain INSERT (no conflict resolution).
+    // Uses ORDER BY ROWID correspondence to map temp rows to their newly inserted target ROWIDs.
+    private static string BuildInsertReturnPLSQL(
+        TableMetadata tableInfo,
+        string tempTableName,
+        string quotedRowIdCol,
+        IReadOnlyList<ColumnMetadata> columns)
+    {
+        var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
+        return $"""
+                DECLARE
+                  TYPE t_temp_rowid_t   IS TABLE OF ROWID INDEX BY PLS_INTEGER;
+                  TYPE t_target_rowid_t IS TABLE OF ROWID INDEX BY PLS_INTEGER;
+                  v_temp_rowids   t_temp_rowid_t;
+                  v_target_rowids t_target_rowid_t;
+                BEGIN
+                  SELECT ROWID BULK COLLECT INTO v_temp_rowids
+                  FROM {tempTableName} ORDER BY ROWID;
+
+                  INSERT INTO {tableInfo.QuotedTableName} ({colList})
+                  SELECT {colList} FROM {tempTableName} ORDER BY ROWID
+                  RETURNING ROWID BULK COLLECT INTO v_target_rowids;
+
+                  FORALL i IN 1..v_target_rowids.COUNT
+                    UPDATE {tempTableName}
+                    SET {quotedRowIdCol} = v_target_rowids(i)
+                    WHERE ROWID = v_temp_rowids(i);
+                END;
+                """;
     }
 
     /// <inheritdoc />
