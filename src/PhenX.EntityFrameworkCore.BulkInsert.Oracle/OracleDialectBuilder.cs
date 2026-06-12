@@ -148,8 +148,8 @@ internal class OracleDialectBuilder : SqlDialectBuilder
             }
         }
 
-        q.AppendLine(";");
-
+        // Oracle executes these statements via ExecuteNonQuery as plain SQL, which must not end
+        // with a statement terminator. A trailing ';' is only valid inside PL/SQL blocks.
         return q.ToString();
     }
 }
