@@ -29,7 +29,6 @@ public static class TestHelpers
     {
         ProviderType[] returningNotSupported = [
             ProviderType.MySql,
-            ProviderType.Oracle,
         ];
 
         Skip.If(strategy is InsertStrategy.InsertReturn or InsertStrategy.InsertReturnAsync && dbContext.IsProvider(returningNotSupported));
