@@ -11,6 +11,7 @@ public class TestDbContext : TestDbContextBase
     public DbSet<TestEntityWithSimpleTypes> TestEntitiesWithSimpleTypes { get; set; } = null!;
     public DbSet<TestEntityWithJson> TestEntitiesWithJson { get; set; } = null!;
     public DbSet<TestEntityWithGuidId> TestEntitiesWithGuidId { get; set; } = null!;
+    public DbSet<TestEntityWithExternalKey> TestEntitiesWithExternalKey { get; set; } = null!;
     public DbSet<TestEntityWithConverters> TestEntitiesWithConverter { get; set; } = null!;
     public DbSet<TestEntityWithComplexType> TestEntitiesWithComplexType { get; set; } = null!;
     public DbSet<TestEntityWithSmartEnum> TestEntitiesWithSmartEnum { get; set; } = null!;
@@ -35,6 +36,13 @@ public class TestDbContext : TestDbContextBase
             builder
                 .ComplexProperty(e => e.OwnedComplexType)
                 .IsRequired();
+        });
+
+        // Unique index on the external (business) key, required so that conflict matching on
+        // ExternalId works for both PostgreSQL (ON CONFLICT) and Oracle (MERGE).
+        modelBuilder.Entity<TestEntityWithExternalKey>(builder =>
+        {
+            builder.HasIndex(e => e.ExternalId).IsUnique();
         });
 
         // Many-to-many with shadow property

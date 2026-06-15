@@ -115,7 +115,12 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
     }
 
     // Builds the PL/SQL block for plain INSERT (no conflict resolution).
-    // Uses ORDER BY ROWID correspondence to map temp rows to their newly inserted target ROWIDs.
+    //
+    // Oracle does NOT support "RETURNING ... BULK COLLECT" on an "INSERT ... SELECT" statement
+    // (ORA-03049). RETURNING BULK COLLECT is only valid with FORALL (collection-bound) DML.
+    // The source rows are therefore bulk-collected from the temp table into PL/SQL collections
+    // and inserted via FORALL, which lets us capture the newly inserted target ROWIDs in the
+    // same iteration order and map them back onto the originating temp rows.
     private static string BuildInsertReturnPLSQL(
         TableMetadata tableInfo,
         string tempTableName,
@@ -123,19 +128,28 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         IReadOnlyList<ColumnMetadata> columns)
     {
         var colList = string.Join(", ", columns.Select(c => c.QuotedColumName));
+        var colDeclarations = string.Join("\n", columns.Select((c, i) =>
+            $"  TYPE t_col{i}_t IS TABLE OF {tempTableName}.{c.QuotedColumName}%TYPE INDEX BY PLS_INTEGER;\n" +
+            $"  v_col{i} t_col{i}_t;"));
+        var selectColList = string.Join(", ", columns.Select(c => c.QuotedColumName));
+        var intoColVars = string.Join(", ", columns.Select((_, i) => $"v_col{i}"));
+        var valuesList = string.Join(", ", columns.Select((_, i) => $"v_col{i}(i)"));
+
         return $"""
                 DECLARE
-                  TYPE t_temp_rowid_t   IS TABLE OF ROWID INDEX BY PLS_INTEGER;
-                  TYPE t_target_rowid_t IS TABLE OF ROWID INDEX BY PLS_INTEGER;
-                  v_temp_rowids   t_temp_rowid_t;
-                  v_target_rowids t_target_rowid_t;
+                  TYPE t_rowid_t IS TABLE OF UROWID INDEX BY PLS_INTEGER;
+                  v_temp_rowids   t_rowid_t;
+                  v_target_rowids t_rowid_t;
+                {colDeclarations}
                 BEGIN
-                  SELECT ROWID BULK COLLECT INTO v_temp_rowids
+                  SELECT ROWID, {selectColList}
+                  BULK COLLECT INTO v_temp_rowids, {intoColVars}
                   FROM {tempTableName} ORDER BY ROWID;
 
-                  INSERT INTO {tableInfo.QuotedTableName} ({colList})
-                  SELECT {colList} FROM {tempTableName} ORDER BY ROWID
-                  RETURNING ROWID BULK COLLECT INTO v_target_rowids;
+                  FORALL i IN 1..v_temp_rowids.COUNT
+                    INSERT INTO {tableInfo.QuotedTableName} ({colList})
+                    VALUES ({valuesList})
+                    RETURNING ROWID BULK COLLECT INTO v_target_rowids;
 
                   FORALL i IN 1..v_target_rowids.COUNT
                     UPDATE {tempTableName}

@@ -344,6 +344,39 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableTheory]
     [InlineData(InsertStrategy.InsertReturn)]
     [InlineData(InsertStrategy.InsertReturnAsync)]
+    public async Task InsertEntities_WithConflict_UpdateGuidColumn(InsertStrategy strategy)
+    {
+        Skip.If(_context.IsProvider(ProviderType.MySql));
+
+        // Arrange - existing row to conflict with (matched on the unique Name column)
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Identifier = Guid.NewGuid() });
+        _context.SaveChanges();
+        _context.ChangeTracker.Clear();
+
+        // A constant Guid emitted as a literal into the UPDATE SET clause. On Oracle the column is
+        // RAW(16); a dashed string literal would fail with ORA-01465, so this guards the HEXTORAW path.
+        var newIdentifier = TestHelpers.NewId();
+
+        var entities = new List<TestEntity>
+        {
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Identifier = Guid.NewGuid() },
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities, _ => {}, new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Identifier = newIdentifier },
+        });
+
+        // Assert - the matched row's Guid column was updated to the constant value, no ORA-01465
+        Assert.Single(insertedEntities);
+        Assert.Equal(newIdentifier, insertedEntities[0].Identifier);
+    }
+
+    [SkippableTheory]
+    [InlineData(InsertStrategy.InsertReturn)]
+    [InlineData(InsertStrategy.InsertReturnAsync)]
     public async Task InsertEntities_WithComplexType_UpdateAll(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));

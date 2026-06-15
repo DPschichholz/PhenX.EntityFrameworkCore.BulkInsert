@@ -19,6 +19,19 @@ public enum InsertStrategy
 
 public static class TestHelpers
 {
+    /// <summary>
+    /// Creates a new application-side primary key value. Uses time-ordered UUIDv7 on .NET 9+
+    /// (better index locality) and falls back to <see cref="Guid.NewGuid"/> on .NET 8.
+    /// </summary>
+    public static Guid NewId()
+    {
+#if NET9_0_OR_GREATER
+        return Guid.CreateVersion7();
+#else
+        return Guid.NewGuid();
+#endif
+    }
+
     public static async Task<List<T>> InsertWithStrategyAsync<T>(
         this TestDbContextBase dbContext,
         InsertStrategy strategy,

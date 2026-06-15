@@ -216,6 +216,10 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [CombinatorialData]
     public async Task InsertEntities_WithOpenTransaction_RollsBackOnFailure(InsertStrategy strategy)
     {
+        // Oracle: the ReturnEntities / conflict paths use a temporary table created and dropped via DDL,
+        // and DDL issues an implicit COMMIT, so the rows cannot be rolled back. See docs/limitations.md.
+        Skip.If(_context.IsProvider(ProviderType.Oracle) && strategy is InsertStrategy.InsertReturn or InsertStrategy.InsertReturnAsync);
+
         // Arrange
         var entities = new List<TestEntity>
         {

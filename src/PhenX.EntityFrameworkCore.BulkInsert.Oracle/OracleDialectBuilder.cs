@@ -16,6 +16,14 @@ internal class OracleDialectBuilder : SqlDialectBuilder
 
     protected override bool SupportsMoveRows => false;
 
+    // Oracle has no BTRIM function (PostgreSQL-specific); the ANSI TRIM removes leading and trailing spaces.
+    protected override string Trim(string lhs) => $"TRIM({lhs})";
+
+    // Oracle (EF Core / ODP.NET) stores System.Guid as RAW(16). A dashed string literal would be
+    // implicitly converted via HEXTORAW and fail with ORA-01465 ("invalid hex number"). Emit an
+    // explicit HEXTORAW literal using the same byte order ODP.NET uses when reading/writing the value.
+    protected override string FormatGuid(Guid value) => $"HEXTORAW('{Convert.ToHexString(value.ToByteArray())}')";
+
     public override string CreateTableCopySql(string tempTableName, TableMetadata tableInfo, IReadOnlyList<ColumnMetadata> columns)
     {
         return CreateTableCopySqlBase(tempTableName, columns);
@@ -111,13 +119,18 @@ internal class OracleDialectBuilder : SqlDialectBuilder
                 // Use insertedColumns instead of all columns because the USING subquery only contains insertedColumns
                 var matchColumnSet = matchColumns.ToHashSet();
                 var updateableColumns = insertedColumns.Where(c => !matchColumnSet.Contains(c.QuotedColumName)).ToList();
-                if (updateableColumns.Count == 0)
+                // Match columns (ON clause) and primary key columns must never be overwritten by an upsert.
+                var updates = ExcludeNonUpdatableColumns(
+                    GetUpdates(context, target, updateableColumns, onConflictTyped.Update),
+                    target,
+                    matchColumns);
+                if (updates.Count == 0)
                 {
                     throw new InvalidOperationException(
-                        "Oracle MERGE cannot update any columns because all available columns are used in the ON clause for conflict detection. " +
-                        "Specify different columns in the 'Match' option or use specific columns in the 'Update' expression.");
+                        "Oracle MERGE cannot update any columns because all targeted columns are match or primary key columns. " +
+                        "Specify different columns in the 'Match' option or in the 'Update' expression.");
                 }
-                q.AppendJoin(", ", GetUpdates(context, target, updateableColumns, onConflictTyped.Update));
+                q.AppendJoin(", ", updates);
                 q.AppendLine();
             }
         }
@@ -225,9 +238,16 @@ internal class OracleDialectBuilder : SqlDialectBuilder
 
         var q = new StringBuilder();
         q.AppendLine("DECLARE");
-        q.AppendLine("  TYPE t_rowid_t IS TABLE OF ROWID INDEX BY PLS_INTEGER;");
+        q.AppendLine("  TYPE t_rowid_t IS TABLE OF UROWID INDEX BY PLS_INTEGER;");
         q.AppendLine("  v_temp_rowids   t_rowid_t;");
         q.AppendLine("  v_insert_rowids t_rowid_t;");
+        // One PL/SQL collection per inserted column, anchored to the temp table column type, so the
+        // not-matched rows can be inserted via FORALL (see Phase 3 for why FORALL is required).
+        for (var i = 0; i < insertedColumns.Count; i++)
+        {
+            q.AppendLine($"  TYPE t_col{i}_t IS TABLE OF {tempTable}.{insertedColumns[i].QuotedColumName}%TYPE INDEX BY PLS_INTEGER;");
+            q.AppendLine($"  v_col{i} t_col{i}_t;");
+        }
         q.AppendLine("BEGIN");
 
         // Phase 1: For every temp row that matches a target row:
@@ -254,7 +274,12 @@ internal class OracleDialectBuilder : SqlDialectBuilder
             // Rewrite each assignment as a correlated subquery so that both t (target outer row) and
             // s (temp inner alias) are accessible, which is required for expressions that reference
             // columns from both tables (e.g. inserted.Price + excluded.Price).
-            var setClauses = GetUpdates(context, target, updateableCols, onConflict.Update)
+            // Match columns and primary key columns are excluded: the primary key must never be
+            // overwritten by an upsert (and on Oracle a RAW(16) PK assignment can raise ORA-01465).
+            var setClauses = ExcludeNonUpdatableColumns(
+                    GetUpdates(context, target, updateableCols, onConflict.Update),
+                    target,
+                    matchColumns)
                 .Select(expr =>
                 {
                     var adapted = expr
@@ -267,19 +292,33 @@ internal class OracleDialectBuilder : SqlDialectBuilder
                 })
                 .ToList();
 
-            q.AppendLine($"  UPDATE {target.QuotedTableName} t");
-            q.AppendLine($"  SET {string.Join(", ", setClauses)}");
-            q.AppendLine($"  WHERE EXISTS (SELECT 1 FROM {tempTable} s WHERE {updatedSubWhere});");
+            // When the only requested updates target match/primary key columns, there is nothing left
+            // to update. The matched rows still have their _target_rowid set in Phase 1, so they are
+            // returned; we simply skip the (otherwise invalid empty) UPDATE statement.
+            if (setClauses.Count != 0)
+            {
+                q.AppendLine($"  UPDATE {target.QuotedTableName} t");
+                q.AppendLine($"  SET {string.Join(", ", setClauses)}");
+                q.AppendLine($"  WHERE EXISTS (SELECT 1 FROM {tempTable} s WHERE {updatedSubWhere});");
+            }
         }
 
         // Phase 3: Insert rows that were not matched at all (_is_matched IS NULL) and capture their
-        // target ROWIDs using the same ORDER BY ROWID correspondence as the plain-insert path.
-        q.AppendLine($"  SELECT ROWID BULK COLLECT INTO v_temp_rowids");
+        // target ROWIDs. Oracle does not support "RETURNING ... BULK COLLECT" on "INSERT ... SELECT"
+        // (ORA-03049), so the not-matched rows are bulk-collected into PL/SQL collections and inserted
+        // via FORALL, which returns the new target ROWIDs in the same iteration order.
+        var selectColList = string.Join(", ", insertedColumns.Select(c => c.QuotedColumName));
+        var intoColVars = string.Join(", ", insertedColumns.Select((_, i) => $"v_col{i}"));
+        var valuesList = string.Join(", ", insertedColumns.Select((_, i) => $"v_col{i}(i)"));
+
+        q.AppendLine($"  SELECT ROWID, {selectColList}");
+        q.AppendLine($"  BULK COLLECT INTO v_temp_rowids, {intoColVars}");
         q.AppendLine($"  FROM {tempTable} WHERE {quotedMatchedCol} IS NULL ORDER BY ROWID;");
         q.AppendLine();
-        q.AppendLine($"  INSERT INTO {target.QuotedTableName} ({colList})");
-        q.AppendLine($"  SELECT {colList} FROM {tempTable} WHERE {quotedMatchedCol} IS NULL ORDER BY ROWID");
-        q.AppendLine($"  RETURNING ROWID BULK COLLECT INTO v_insert_rowids;");
+        q.AppendLine($"  FORALL i IN 1..v_temp_rowids.COUNT");
+        q.AppendLine($"    INSERT INTO {target.QuotedTableName} ({colList})");
+        q.AppendLine($"    VALUES ({valuesList})");
+        q.AppendLine($"    RETURNING ROWID BULK COLLECT INTO v_insert_rowids;");
         q.AppendLine();
         q.AppendLine($"  FORALL i IN 1..v_insert_rowids.COUNT");
         q.AppendLine($"    UPDATE {tempTable} SET {quotedRowIdCol} = v_insert_rowids(i)");
@@ -287,5 +326,31 @@ internal class OracleDialectBuilder : SqlDialectBuilder
         q.AppendLine("END;");
 
         return q.ToString();
+    }
+
+    /// <summary>
+    /// Removes update assignments that target match columns or primary key columns. Oracle forbids
+    /// updating ON-clause (match) columns, and the primary key must never be overwritten by an upsert
+    /// (overwriting a RAW(16) GUID primary key additionally raises ORA-01465).
+    /// </summary>
+    private List<string> ExcludeNonUpdatableColumns(
+        IEnumerable<string> updateClauses,
+        TableMetadata target,
+        IEnumerable<string> matchColumns)
+    {
+        var excluded = new HashSet<string>(matchColumns);
+        foreach (var pk in target.PrimaryKey)
+        {
+            excluded.Add(pk.QuotedColumName);
+        }
+
+        return updateClauses
+            .Where(clause =>
+            {
+                var eq = clause.IndexOf(" = ", StringComparison.Ordinal);
+                var column = eq < 0 ? clause : clause[..eq];
+                return !excluded.Contains(column);
+            })
+            .ToList();
     }
 }

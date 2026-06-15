@@ -1,4 +1,5 @@
 using System.Linq.Expressions;
+using System.Globalization;
 using System.Text;
 
 using Microsoft.EntityFrameworkCore;
@@ -289,6 +290,15 @@ internal abstract class SqlDialectBuilder
     /// <exception cref="NotSupportedException">Thrown when an expression could not be translated.</exception>
     private string ToSqlExpression<TEntity>(DbContext context, TableMetadata table, Expression expr, LambdaExpression? lambda = null)
     {
+        // Expressions that do not reference any lambda parameter (e.g. Guid.CreateVersion7(),
+        // DateTime.UtcNow, captured local variables) cannot be translated to SQL but are constant
+        // from the statement's point of view, so they are evaluated locally and emitted as literals.
+        if (expr is not ConstantExpression && expr is not ParameterExpression && !ReferencesParameter(expr))
+        {
+            var value = Expression.Lambda(expr).Compile().DynamicInvoke();
+            return FormatConstant(value, expr.Type);
+        }
+
         switch (expr)
         {
             case LambdaExpression memberExpr:
@@ -351,23 +361,7 @@ internal abstract class SqlDialectBuilder
                 }
 
             case ConstantExpression contantExpr:
-                if (contantExpr.Type == typeof(RawSqlValue) && contantExpr.Value != null)
-                {
-                    return ((RawSqlValue)contantExpr.Value!).Sql;
-                }
-
-                if (contantExpr.Type == typeof(string) ||
-                    contantExpr.Type == typeof(Guid))
-                {
-                    return $"'{contantExpr.Value}'";
-                }
-
-                if (contantExpr.Type == typeof(bool))
-                {
-                    return (bool)contantExpr.Value! ? "TRUE" : "FALSE";
-                }
-
-                return contantExpr.Value?.ToString() ?? "NULL";
+                return FormatConstant(contantExpr.Value, contantExpr.Type);
 
             case UnaryExpression unaryExpr:
                 if (unaryExpr.NodeType == ExpressionType.Convert)
@@ -439,6 +433,82 @@ internal abstract class SqlDialectBuilder
                 // Simple property assignment - the column name is the property name
                 yield return $"{table.GetQuotedColumnName(binding.Member.Name)} = {ToSqlExpression<T>(context, table, binding.Expression, lambda)}";
             }
+        }
+    }
+
+    /// <summary>
+    /// Formats a constant value as an SQL literal.
+    /// </summary>
+    private string FormatConstant(object? value, Type type)
+    {
+        var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
+
+        if (value == null)
+        {
+            return "NULL";
+        }
+
+        if (underlyingType == typeof(RawSqlValue))
+        {
+            return ((RawSqlValue)value).Sql;
+        }
+
+        if (value is RawSqlValue rawSqlValue)
+        {
+            return rawSqlValue.Sql;
+        }
+
+        if (underlyingType == typeof(Guid))
+        {
+            return FormatGuid((Guid)value);
+        }
+
+        if (underlyingType == typeof(string))
+        {
+            return $"'{value}'";
+        }
+
+        if (underlyingType == typeof(bool))
+        {
+            return (bool)value ? "TRUE" : "FALSE";
+        }
+
+        // Numeric and other formattable values must use the invariant culture so that, for example,
+        // a decimal is rendered as "42.5" and not the culture-specific "42,5" which is invalid SQL.
+        if (value is IFormattable formattable)
+        {
+            return formattable.ToString(null, CultureInfo.InvariantCulture);
+        }
+
+        return value.ToString() ?? "NULL";
+    }
+
+    /// <summary>
+    /// Formats a <see cref="Guid"/> constant as an SQL literal. The default renders the canonical
+    /// dashed string form (valid for providers that store GUIDs as text/uniqueidentifier). Providers
+    /// that store GUIDs as binary (e.g. Oracle RAW(16)) must override this.
+    /// </summary>
+    protected virtual string FormatGuid(Guid value) => $"'{value}'";
+
+    /// <summary>
+    /// Determines whether an expression references any parameter expression, meaning it cannot be
+    /// evaluated locally as a constant.
+    /// </summary>
+    private static bool ReferencesParameter(Expression expr)
+    {
+        var visitor = new ParameterReferenceVisitor();
+        visitor.Visit(expr);
+        return visitor.Found;
+    }
+
+    private sealed class ParameterReferenceVisitor : ExpressionVisitor
+    {
+        public bool Found { get; private set; }
+
+        protected override Expression VisitParameter(ParameterExpression node)
+        {
+            Found = true;
+            return base.VisitParameter(node);
         }
     }
 

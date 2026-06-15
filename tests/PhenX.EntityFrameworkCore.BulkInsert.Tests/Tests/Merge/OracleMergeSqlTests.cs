@@ -55,6 +55,141 @@ public class OracleMergeSqlTests
         sql.Should().Contain("MERGE INTO");
         sql.TrimEnd().Should().NotEndWith(";");
     }
+
+    [Fact]
+    public void BuildUpsertReturnPLSQL_InsertsNotMatchedRows_ViaForallNotInsertSelect()
+    {
+        using var context = CreateContext();
+
+        var provider = context.GetService<IBulkInsertProvider>();
+        var dialect = (OracleDialectBuilder)provider.SqlDialect;
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var insertedColumns = tableInfo.GetColumns(includeGenerated: false);
+
+        var onConflict = new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Price = excluded.Price },
+        };
+
+        var sql = dialect.BuildUpsertReturnPLSQL(
+            context,
+            tableInfo,
+            "source_temp",
+            "\"_target_rowid\"",
+            "\"_is_matched\"",
+            insertedColumns,
+            onConflict);
+
+        // Oracle rejects "RETURNING ... BULK COLLECT" on an "INSERT ... SELECT" statement (ORA-03049).
+        // The not-matched rows must therefore be inserted via FORALL using VALUES, not a SELECT subquery.
+        sql.Should().Contain("FORALL i IN 1..v_temp_rowids.COUNT");
+        sql.Should().Contain("RETURNING ROWID BULK COLLECT INTO v_insert_rowids");
+        System.Text.RegularExpressions.Regex
+            .IsMatch(sql, @"INSERT\s+INTO[\s\S]*?SELECT[\s\S]*?RETURNING")
+            .Should().BeFalse("RETURNING is not valid on INSERT ... SELECT in Oracle");
+    }
+
+    [Fact]
+    public void BuildUpsertReturnPLSQL_UsesUrowidCollections_ToAvoidOra01465()
+    {
+        using var context = CreateContext();
+
+        var provider = context.GetService<IBulkInsertProvider>();
+        var dialect = (OracleDialectBuilder)provider.SqlDialect;
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var insertedColumns = tableInfo.GetColumns(includeGenerated: false);
+
+        var onConflict = new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Price = excluded.Price },
+        };
+
+        var sql = dialect.BuildUpsertReturnPLSQL(
+            context,
+            tableInfo,
+            "source_temp",
+            "\"_target_rowid\"",
+            "\"_is_matched\"",
+            insertedColumns,
+            onConflict);
+
+        // Oracle 21c/23 tables produce extended ROWIDs (base-64), which fail with ORA-01465 when
+        // assigned to a ROWID-typed target. The ROWID collections must therefore be UROWID.
+        sql.Should().Contain("TABLE OF UROWID");
+        sql.Should().NotContain("TABLE OF ROWID");
+    }
+
+    [Fact]
+    public void BuildUpsertReturnPLSQL_FormatsGuidConstantAsHexToRaw_ToAvoidOra01465()
+    {
+        using var context = CreateContext();
+
+        var provider = context.GetService<IBulkInsertProvider>();
+        var dialect = (OracleDialectBuilder)provider.SqlDialect;
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var insertedColumns = tableInfo.GetColumns(includeGenerated: false);
+
+        var guid = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+        var onConflict = new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            // Identifier maps to a RAW(16) column; a dashed string literal would fail with ORA-01465.
+            Update = (inserted, excluded) => new TestEntity { Identifier = guid },
+        };
+
+        var sql = dialect.BuildUpsertReturnPLSQL(
+            context,
+            tableInfo,
+            "source_temp",
+            "\"_target_rowid\"",
+            "\"_is_matched\"",
+            insertedColumns,
+            onConflict);
+
+        // ODP.NET stores System.Guid using Guid.ToByteArray() order; the literal must match it.
+        sql.Should().Contain("HEXTORAW('33221100554477668899AABBCCDDEEFF')");
+        sql.Should().NotContain($"'{guid}'");
+    }
+
+    [Fact]
+    public void BuildUpsertReturnPLSQL_DoesNotUpdatePrimaryKeyColumn_ToAvoidOra01465()
+    {
+        using var context = CreateContext();
+
+        var provider = context.GetService<IBulkInsertProvider>();
+        var dialect = (OracleDialectBuilder)provider.SqlDialect;
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var insertedColumns = tableInfo.GetColumns(includeGenerated: true);
+
+        var onConflict = new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            // The Update expression assigns the primary key. It must be filtered out so the PK is
+            // never overwritten (a RAW(16) PK assignment would additionally raise ORA-01465).
+            Update = (inserted, excluded) => new TestEntity
+            {
+                Id = 42,
+                Price = excluded.Price,
+            },
+        };
+
+        var sql = dialect.BuildUpsertReturnPLSQL(
+            context,
+            tableInfo,
+            "source_temp",
+            "\"_target_rowid\"",
+            "\"_is_matched\"",
+            insertedColumns,
+            onConflict);
+
+        // The primary key column must not appear on the left-hand side of an UPDATE assignment.
+        sql.Should().NotContain($"{tableInfo.GetQuotedColumnName(nameof(TestEntity.Id))} = ");
+        // The non-key, non-match column is still updated.
+        sql.Should().Contain($"{tableInfo.GetQuotedColumnName(nameof(TestEntity.Price))} = ");
+    }
 }
+
 
 

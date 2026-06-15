@@ -111,8 +111,8 @@ a conflict is detected (e.g., update existing rows), using the `onConflict` para
 * The conflicting columns are specified with the `Match` property and must have a unique constraint in the database.
 * The action to take when a conflict is detected is specified with the `Update` property. If not specified, the default action is to do nothing (i.e., skip the conflicting rows).
 * You can also specify the condition for the update action using either the `Where` or the `RawWhere` property. If not specified, the update action will be applied to all conflicting rows.
-
-```csharp
+* Primary key and `Match` columns are never overwritten by the update action, even if they are assigned in the `Update` expression. The primary key of a matched (updated) row always keeps its existing value.
+* Inside the `Update` (and `Where`) expressions, any sub-expression that does not reference the `inserted`/`excluded` parameters (e.g. a constant, a captured local variable or a parameterless call like `Guid.CreateVersion7()` or `DateTime.UtcNow`) is evaluated locally and emitted as a literal value.```csharp
 await dbContext.ExecuteBulkInsertAsync(entities, onConflict: new OnConflictOptions<TestEntity>
 {
     Match = e => new

@@ -23,7 +23,7 @@ public class TestDbContainerOracle(IMessageSink messageSink) : TestDbContainer<O
 {
     public override DbProviderFactory DbProviderFactory => OracleClientFactory.Instance;
 
-    protected override OracleBuilder CreateBuilder() => new("gvenzl/oracle-free:23-slim-faststart");
+    protected override OracleBuilder CreateBuilder() => new("gvenzl/oracle-free:23.6-slim-faststart");
 
     protected override void Configure(DbContextOptionsBuilder optionsBuilder, string databaseName)
     {
