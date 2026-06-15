@@ -101,20 +101,12 @@ internal class OracleDialectBuilder : SqlDialectBuilder
 
             if (onConflictTyped.Update != null)
             {
-                q.Append("WHEN MATCHED ");
-
-                if (onConflictTyped.RawWhere != null || onConflictTyped.Where != null)
+                if (onConflictTyped is { RawWhere: not null, Where: not null })
                 {
-                    if (onConflictTyped is { RawWhere: not null, Where: not null })
-                    {
-                        throw new ArgumentException("Cannot specify both RawWhere and Where in OnConflictOptions.");
-                    }
-
-                    q.Append("AND ");
-                    AppendConflictCondition(q, target, context, onConflictTyped);
+                    throw new ArgumentException("Cannot specify both RawWhere and Where in OnConflictOptions.");
                 }
 
-                q.AppendLine("THEN UPDATE SET ");
+                q.Append("WHEN MATCHED THEN UPDATE SET ");
                 // Oracle MERGE: columns in ON clause cannot be updated, so exclude match columns
                 // Use insertedColumns instead of all columns because the USING subquery only contains insertedColumns
                 var matchColumnSet = matchColumns.ToHashSet();
@@ -132,6 +124,14 @@ internal class OracleDialectBuilder : SqlDialectBuilder
                 }
                 q.AppendJoin(", ", updates);
                 q.AppendLine();
+
+                // Oracle MERGE does not support "WHEN MATCHED AND <condition> THEN"; the update
+                // condition must be expressed as a trailing WHERE clause after the SET assignments.
+                if (onConflictTyped.RawWhere != null || onConflictTyped.Where != null)
+                {
+                    q.Append("WHERE ");
+                    AppendConflictCondition(q, target, context, onConflictTyped);
+                }
             }
         }
 

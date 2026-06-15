@@ -22,12 +22,24 @@ public class Program
 #if MYSQL_SUPPORTED
             typeof(LibComparatorMySql),
 #endif
-            typeof(LibComparatorPostgreSql),
-            typeof(LibComparatorSqlite),
-            typeof(LibComparatorSqlServer),
+            //typeof(LibComparatorPostgreSql),
+            //typeof(LibComparatorSqlite),
+            //typeof(LibComparatorSqlServer),
             typeof(LibComparatorOracle),
         };
 
-        BenchmarkRunner.Run(comparators, config);
+        // Upsert / merge (conflict resolution) comparison benchmarks
+        var upsertComparators = new[]
+        {
+#if MYSQL_SUPPORTED
+            typeof(UpsertComparatorMySql),
+#endif
+            //typeof(UpsertComparatorPostgreSql),
+            //typeof(UpsertComparatorSqlite),
+            //typeof(UpsertComparatorSqlServer),
+            typeof(UpsertComparatorOracle),
+        };
+
+        BenchmarkRunner.Run([..comparators, ..upsertComparators], config);
     }
 }

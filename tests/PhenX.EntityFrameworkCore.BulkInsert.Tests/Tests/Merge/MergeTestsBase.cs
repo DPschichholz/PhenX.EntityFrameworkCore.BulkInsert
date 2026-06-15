@@ -235,6 +235,40 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
         Assert.Contains(insertedEntities, e => e.Name == $"{_run}_Entity1" && e.Price == 30);
     }
 
+    [SkippableFact]
+    public async Task BulkInsert_WithConflict_ConditionalUpdate_AppliesWhereOnMerge()
+    {
+        // Exercises the conflict-resolution path without returning entities (Oracle MERGE etc.).
+        // The conditional update must be applied as a trailing WHERE; on Oracle, generating
+        // "WHEN MATCHED AND <condition> THEN" previously raised ORA-02000 ("missing THEN keyword").
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity2", Price = 10 });
+        _context.SaveChanges();
+        _context.ChangeTracker.Clear();
+
+        var entities = new List<TestEntity>
+        {
+            // Higher price -> condition (excluded.Price > inserted.Price) holds -> updated.
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 20 },
+            // Lower price -> condition does not hold -> kept at original price.
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity2", Price = 5 },
+        };
+
+        await _context.ExecuteBulkInsertAsync(entities, onConflict: new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Price = excluded.Price },
+            Where = (inserted, excluded) => excluded.Price > inserted.Price,
+        });
+
+        _context.ChangeTracker.Clear();
+        var entity1 = _context.TestEntities.Single(e => e.TestRun == _run && e.Name == $"{_run}_Entity1");
+        var entity2 = _context.TestEntities.Single(e => e.TestRun == _run && e.Name == $"{_run}_Entity2");
+
+        entity1.Price.Should().Be(20);
+        entity2.Price.Should().Be(10);
+    }
+
     [SkippableTheory]
     [InlineData(InsertStrategy.InsertReturn)]
     [InlineData(InsertStrategy.InsertReturnAsync)]

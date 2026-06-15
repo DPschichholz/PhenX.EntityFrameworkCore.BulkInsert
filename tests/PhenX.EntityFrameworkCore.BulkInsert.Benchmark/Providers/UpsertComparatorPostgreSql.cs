@@ -1,7 +1,5 @@
 using DotNet.Testcontainers.Containers;
 
-using LinqToDB.EntityFrameworkCore;
-
 using Microsoft.EntityFrameworkCore;
 
 using PhenX.EntityFrameworkCore.BulkInsert.PostgreSql;
@@ -10,7 +8,7 @@ using Testcontainers.PostgreSql;
 
 namespace PhenX.EntityFrameworkCore.BulkInsert.Benchmark.Providers;
 
-public class LibComparatorPostgreSql : LibComparator
+public class UpsertComparatorPostgreSql : UpsertComparator
 {
     protected override void ConfigureDbContext()
     {
@@ -19,7 +17,6 @@ public class LibComparatorPostgreSql : LibComparator
         DbContext = new TestDbContext(p => p
             .UseNpgsql(connectionString)
             .UseBulkInsertPostgreSql()
-            .UseLinqToDB()
         );
     }
 
@@ -32,3 +29,4 @@ public class LibComparatorPostgreSql : LibComparator
             .Build();
     }
 }
+

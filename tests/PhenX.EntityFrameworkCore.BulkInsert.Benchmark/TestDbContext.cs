@@ -8,6 +8,8 @@ public class TestDbContext(Action<DbContextOptionsBuilder> configure) : DbContex
 
     public DbSet<TestEntity> TestEntities { get; set; } = null!;
 
+    public DbSet<UpsertTestEntity> UpsertEntities { get; set; } = null!;
+
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         Configure(optionsBuilder);
