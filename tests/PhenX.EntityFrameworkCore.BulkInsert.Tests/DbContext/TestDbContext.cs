@@ -11,6 +11,7 @@ public class TestDbContext : TestDbContextBase
     public DbSet<TestEntityWithSimpleTypes> TestEntitiesWithSimpleTypes { get; set; } = null!;
     public DbSet<TestEntityWithJson> TestEntitiesWithJson { get; set; } = null!;
     public DbSet<TestEntityWithGuidId> TestEntitiesWithGuidId { get; set; } = null!;
+    public DbSet<TestEntityWithGeneratedGuidId> TestEntitiesWithGeneratedGuidId { get; set; } = null!;
     public DbSet<TestEntityWithExternalKey> TestEntitiesWithExternalKey { get; set; } = null!;
     public DbSet<TestEntityWithConverters> TestEntitiesWithConverter { get; set; } = null!;
     public DbSet<TestEntityWithComplexType> TestEntitiesWithComplexType { get; set; } = null!;
@@ -24,6 +25,14 @@ public class TestDbContext : TestDbContextBase
         base.OnModelCreating(modelBuilder);
 
         modelBuilder.ConfigureSmartEnum();
+
+        modelBuilder.Entity<TestEntityWithGeneratedGuidId>(builder =>
+        {
+            builder.HasKey(e => e.Id);
+            builder.Property(e => e.Id)
+                .ValueGeneratedOnAdd()
+                .HasValueGenerator<GuidV7ValueGenerator>();
+        });
 
         modelBuilder.Entity<TestEntityWithConverters>(builder =>
         {

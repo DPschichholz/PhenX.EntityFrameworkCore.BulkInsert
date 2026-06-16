@@ -328,6 +328,72 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
 
     [SkippableTheory]
     [CombinatorialData]
+    public async Task InsertEntities_RunsClientSideValueGenerator(InsertStrategy strategy)
+    {
+        // Arrange - Ids are left unset so the configured value generator must populate them.
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities);
+
+        // Assert - the value generator produced unique, non-empty keys (no PK violation)...
+        insertedEntities.Should().HaveCount(2);
+        insertedEntities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        insertedEntities.Select(e => e.Id).Should().OnlyHaveUniqueItems();
+
+        // ...and the generated values were written back onto the source entities.
+        entities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        entities.Select(e => e.Id).Should().BeEquivalentTo(insertedEntities.Select(e => e.Id));
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
+    public async Task InsertEntities_RunsValueGenerator_WithCopyGeneratedColumns(InsertStrategy strategy)
+    {
+        // Arrange
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities,
+            o => o.CopyGeneratedColumns = true);
+
+        // Assert
+        insertedEntities.Should().HaveCount(2);
+        insertedEntities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        insertedEntities.Select(e => e.Id).Should().OnlyHaveUniqueItems();
+        entities.Select(e => e.Id).Should().BeEquivalentTo(insertedEntities.Select(e => e.Id));
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
+    public async Task InsertEntities_ValueGenerator_PreservesExplicitlySetIds(InsertStrategy strategy)
+    {
+        // Arrange - when an Id is explicitly set (not the sentinel), the generator must not override it.
+        var explicitId1 = TestHelpers.NewId();
+        var explicitId2 = TestHelpers.NewId();
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Id = explicitId1, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Id = explicitId2, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities);
+
+        // Assert
+        insertedEntities.Select(e => e.Id).Should().BeEquivalentTo([explicitId1, explicitId2]);
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
     public async Task HandleProgress(InsertStrategy strategy)
     {
         // Arrange

@@ -86,6 +86,30 @@ internal static class PropertyAccessor
         return Expression.Lambda<Func<object, object?>>(finalExpression, instanceParam).Compile();
     }
 
+    /// <summary>
+    /// Creates a setter that writes a value back onto the entity property, used to persist
+    /// values produced by a client-side value generator so that repeated reads are stable and
+    /// the originating entity reflects the generated value (matching EF Core SaveChanges semantics).
+    /// </summary>
+    public static Action<object, object?> CreateSetter(PropertyInfo propertyInfo)
+    {
+        ArgumentNullException.ThrowIfNull(propertyInfo);
+
+        // (instance, value) => { }
+        var instanceParam = Expression.Parameter(typeof(object), "instance");
+        var valueParam = Expression.Parameter(typeof(object), "value");
+
+        var typedInstance = GetTypedInstance(propertyInfo.DeclaringType!, instanceParam);
+
+        // ((TValue)value)
+        var typedValue = Expression.Convert(valueParam, propertyInfo.PropertyType);
+
+        // ((TEntity)instance).Property = (TValue)value
+        var assign = Expression.Assign(Expression.Property(typedInstance, propertyInfo), typedValue);
+
+        return Expression.Lambda<Action<object, object?>>(assign, instanceParam, valueParam).Compile();
+    }
+
     private static UnaryExpression GetTypedInstance(Type propDeclaringType, ParameterExpression instanceParam)
     {
         return propDeclaringType.IsValueType

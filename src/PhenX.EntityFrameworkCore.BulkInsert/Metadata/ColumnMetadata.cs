@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.ValueGeneration;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Dialect;
 using PhenX.EntityFrameworkCore.BulkInsert.Options;
@@ -21,7 +22,15 @@ internal sealed class ColumnMetadata
         QuotedColumName = dialect.Quote(ColumnName);
         StoreDefinition = GetStoreDefinition(property);
         ClrType = property.ClrType;
-        IsGenerated = property.ValueGenerated != ValueGenerated.Never
+
+        // A client-side value generator (configured via HasValueGenerator + ValueGeneratedOnAdd) is
+        // normally invoked by EF Core during SaveChanges. Bulk insert bypasses the change tracker,
+        // so the generator is executed here, while reading the column value, for any entity whose
+        // current value still equals the sentinel (i.e. it was not explicitly set by the caller).
+        TryBuildValueGenerator(property, complexProperty);
+
+        IsGenerated = _valueGenerator == null
+                      && property.ValueGenerated != ValueGenerated.Never
                       && (property.GetDefaultValueSql() != null
                           || property.GetComputedColumnSql() != null
                           || property.FindAnnotation(RelationalAnnotationNames.DefaultValue) != null
@@ -29,6 +38,11 @@ internal sealed class ColumnMetadata
     }
 
     private readonly Func<object, object?> _getter;
+
+    private ValueGenerator? _valueGenerator;
+    private Func<object, object?>? _rawGetter;
+    private Action<object, object?>? _setter;
+    private object? _sentinel;
 
     public IProperty Property { get; }
 
@@ -46,6 +60,8 @@ internal sealed class ColumnMetadata
 
     public object GetValue(object entity, BulkInsertOptions options)
     {
+        EnsureGeneratedValue(entity);
+
         var result = _getter(entity);
 
         if (options.Converters != null && result != null)
@@ -61,6 +77,51 @@ internal sealed class ColumnMetadata
         }
 
         return result ?? DBNull.Value;
+    }
+
+    private void EnsureGeneratedValue(object entity)
+    {
+        if (_valueGenerator == null)
+        {
+            return;
+        }
+
+        var current = _rawGetter!(entity);
+        if (!Equals(current, _sentinel))
+        {
+            return;
+        }
+
+        // EntityEntry is intentionally not provided: bulk insert never tracks entities.
+        // Standard value generators (e.g. Guid generators) do not use the entry.
+        var generated = _valueGenerator.Next(null!);
+
+        // Writing the value back makes repeated reads of the same row stable (some providers
+        // read each column more than once) and reflects the generated value on the source entity.
+        _setter!(entity, generated);
+    }
+
+    private void TryBuildValueGenerator(IProperty property, IComplexProperty? complexProperty)
+    {
+        // Only client-side generators explicitly configured via HasValueGenerator are supported.
+        // Database-generated values and EF's implicit default selectors are not handled here.
+        if (complexProperty != null
+            || property.ValueGenerated == ValueGenerated.Never
+            || property.PropertyInfo?.SetMethod == null)
+        {
+            return;
+        }
+
+        var factory = property.GetValueGeneratorFactory();
+        if (factory == null)
+        {
+            return;
+        }
+
+        _valueGenerator = factory(property, property.DeclaringType);
+        _rawGetter = PropertyAccessor.CreateGetter(property.PropertyInfo);
+        _setter = PropertyAccessor.CreateSetter(property.PropertyInfo);
+        _sentinel = property.Sentinel;
     }
 
     private static Func<object, object?> BuildGetter(IProperty property, IComplexProperty? complexProperty)
