@@ -543,8 +543,7 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableTheory]
     [CombinatorialData]
     public async Task InsertsEntities_WithComplexType(InsertStrategy strategy)
-    {
-        // Arrange
+    {        // Arrange
         var entities = new List<TestEntityWithComplexType>
         {
             new TestEntityWithComplexType
@@ -575,5 +574,50 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
         // Assert
         insertedEntities.Should().BeEquivalentTo(entities,
             o => o.RespectingRuntimeTypes().Excluding(e => e.Id));
+    }
+
+    [SkippableFact]
+    public async Task InsertEntities_WhenCancelled_DoesNotLeaveLockOrSession()
+    {
+        // MySql does not observe cancellation the same way; the bulk copy abort hook is provider-specific.
+        Skip.If(_context.IsProvider(ProviderType.MySql));
+
+        // Arrange - enough rows so that cancellation can trigger at a batch boundary before completion.
+        const int count = 100_000;
+        var entities = Enumerable.Range(1, count).Select(i => new TestEntity
+        {
+            TestRun = _run,
+            Name = $"{_run}_Cancel{i}",
+        }).ToList();
+
+        using var cts = new CancellationTokenSource();
+
+        // Act - cancel as soon as the first batch is reported, then ensure the operation is aborted.
+        var act = async () =>
+        {
+            await _context.ExecuteBulkInsertAsync(entities, o =>
+            {
+                o.NotifyProgressAfter = 1;
+                o.OnProgress = _ => cts.Cancel();
+            }, cancellationToken: cts.Token);
+        };
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+
+        _context.ChangeTracker.Clear();
+
+        // Assert - a follow-up operation on the same table must complete promptly, proving that no
+        // table lock / server session was left hanging by the cancelled direct-path / bulk load.
+        using var followUpCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var followUp = new List<TestEntity>
+        {
+            new TestEntity { TestRun = _run, Name = $"{_run}_AfterCancel" },
+        };
+
+        await _context.ExecuteBulkInsertAsync(followUp, _ => { }, cancellationToken: followUpCts.Token);
+
+        _context.ChangeTracker.Clear();
+        var persisted = _context.TestEntities.Where(x => x.TestRun == _run && x.Name == $"{_run}_AfterCancel").ToList();
+        persisted.Should().ContainSingle();
     }
 }

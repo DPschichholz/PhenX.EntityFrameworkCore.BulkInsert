@@ -56,6 +56,7 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         activity?.AddTag("synchronous", sync);
 
         var connection = await context.GetConnection(sync, ctk);
+        var committed = false;
         try
         {
             var tempTableName = await CreateTableCopyAsync<T>(sync, context, options, tableInfo, ctk);
@@ -107,9 +108,17 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
             }
 
             await connection.Commit(sync, ctk);
+            committed = true;
         }
         finally
         {
+            // On cancellation/failure (commit not reached), roll back our own transaction first to
+            // release server-side locks promptly instead of relying on the dispose in Close.
+            if (!committed)
+            {
+                await connection.Rollback(sync);
+            }
+
             await connection.Close(sync, ctk);
         }
     }
@@ -191,33 +200,25 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         bulkCopy.BatchSize = options.BatchSize;
         bulkCopy.BulkCopyTimeout = options.GetCopyTimeoutInSeconds();
 
-        // Handle progress notifications
-        if (options is { NotifyProgressAfter: not null, OnProgress: not null })
+        // OracleBulkCopy only evaluates cancellation in the OracleRowsCopied event, which fires
+        // every NotifyAfter rows. A value must always be set (even without progress callback) so
+        // that cancellation is observed promptly instead of only at the end of the whole load.
+        bulkCopy.NotifyAfter = options.NotifyProgressAfter ?? options.BatchSize;
+
+        var hasProgress = options is { NotifyProgressAfter: not null, OnProgress: not null };
+
+        bulkCopy.OracleRowsCopied += (_, e) =>
         {
-            bulkCopy.NotifyAfter = options.NotifyProgressAfter.Value;
-
-            bulkCopy.OracleRowsCopied += (sender, e) =>
+            if (hasProgress)
             {
-                options.OnProgress(e.RowsCopied);
+                options.OnProgress!(e.RowsCopied);
+            }
 
-                if (ctk.IsCancellationRequested)
-                {
-                    e.Abort = true;
-                }
-            };
-        }
-
-        // If no progress notification is set, we still need to handle cancellation.
-        else
-        {
-            bulkCopy.OracleRowsCopied += (sender, e) =>
+            if (ctk.IsCancellationRequested)
             {
-                if (ctk.IsCancellationRequested)
-                {
-                    e.Abort = true;
-                }
-            };
-        }
+                e.Abort = true;
+            }
+        };
 
         foreach (var column in columns)
         {
@@ -226,7 +227,29 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
 
         var dataReader = new EnumerableDataReader<T>(entities, columns, options);
 
-        bulkCopy.WriteToServer(dataReader);
+        try
+        {
+            bulkCopy.WriteToServer(dataReader);
+        }
+        catch
+        {
+            // OracleBulkCopy runs a direct-path load that does NOT enlist in the EF transaction and
+            // holds an exclusive (TM) lock on the destination table. When the load is aborted (via
+            // e.Abort on cancellation) ODP.NET throws; surface a clean cancellation in that case.
+            if (ctk.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(ctk);
+            }
+
+            throw;
+        }
+        finally
+        {
+            // Explicitly close the bulk copy so the direct-path stream is finalized and the table
+            // lock / server session is released before the object is disposed. Without this an
+            // aborted load can leave a lock or session hanging on the server.
+            bulkCopy.Close();
+        }
 
         return Task.CompletedTask;
     }
