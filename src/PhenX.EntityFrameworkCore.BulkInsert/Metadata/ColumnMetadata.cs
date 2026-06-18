@@ -20,6 +20,8 @@ internal sealed class ColumnMetadata
         PropertyName = property.Name;
         ColumnName = ownerTable == null ? property.GetColumnName() : property.GetColumnName(ownerTable.Value)!;
         QuotedColumName = dialect.Quote(ColumnName);
+        StoreType = property.GetRelationalTypeMapping().StoreType;
+        IsNullable = property.IsNullable;
         StoreDefinition = GetStoreDefinition(property);
         ClrType = property.ClrType;
 
@@ -53,6 +55,16 @@ internal sealed class ColumnMetadata
     public string QuotedColumName { get; }
 
     public string StoreDefinition { get; }
+
+    /// <summary>
+    /// The provider store type without nullability (e.g. "NUMBER(19)", "VARCHAR2(200)").
+    /// </summary>
+    public string StoreType { get; }
+
+    /// <summary>
+    /// Whether the mapped column is nullable in the target table.
+    /// </summary>
+    public bool IsNullable { get; }
 
     public Type ClrType { get; }
 

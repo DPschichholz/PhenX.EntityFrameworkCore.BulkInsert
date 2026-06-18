@@ -190,5 +190,8 @@ public class TestDbContextOracle : TestDbContext
         {
             b.Property(x => x.StringEnumValue).HasColumnType("nvarchar2(255)");
         });
+
+        // Wide (~23 column) entity exercising the Oracle GTT upsert pipeline with a large payload.
+        modelBuilder.Entity<OracleWideUpsertEntity>();
     }
 }
