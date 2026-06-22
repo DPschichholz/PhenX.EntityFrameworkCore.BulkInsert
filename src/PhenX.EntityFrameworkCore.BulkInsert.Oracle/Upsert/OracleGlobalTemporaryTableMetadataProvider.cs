@@ -59,6 +59,8 @@ internal sealed class OracleGlobalTemporaryTableMetadataProvider
 
     /// <summary>
     /// Derives the deterministic GTT name for a target table, honoring the optional override.
+    /// The target table name is taken verbatim from the EF Core model (no case folding) so the GTT
+    /// name follows the same identifier conventions as the mapped table.
     /// </summary>
     public string GetStagingTableName(string targetTableName, string? overrideName = null)
     {
@@ -67,15 +69,14 @@ internal sealed class OracleGlobalTemporaryTableMetadataProvider
             return overrideName!;
         }
 
-        var name = $"{Prefix}{targetTableName.ToUpperInvariant()}{Suffix}";
+        var name = $"{Prefix}{targetTableName}{Suffix}";
         if (name.Length <= MaxIdentifierLength)
         {
             return name;
         }
 
         var available = MaxIdentifierLength - Prefix.Length - Suffix.Length;
-        var trimmed = targetTableName.ToUpperInvariant();
-        trimmed = trimmed.Length > available ? trimmed[..available] : trimmed;
+        var trimmed = targetTableName.Length > available ? targetTableName[..available] : targetTableName;
         return $"{Prefix}{trimmed}{Suffix}";
     }
 

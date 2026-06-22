@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Abstractions;
 
@@ -42,6 +43,10 @@ internal sealed class MetadataProvider
             }
 
             var provider = context.GetService<IBulkInsertProvider>();
+
+            // Delegate identifier delimiting to EF Core's conventions (case preservation, embedded
+            // delimiter escaping) so generated names match the model exactly.
+            provider.SqlDialect.UseSqlGenerationHelper(context.GetService<ISqlGenerationHelper>());
 
             var tableMetadata = new TableMetadata(entityType, provider.SqlDialect);
             tables[modelType] = tableMetadata;

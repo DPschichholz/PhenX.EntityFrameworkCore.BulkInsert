@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Metadata;
 using PhenX.EntityFrameworkCore.BulkInsert.Options;
@@ -14,8 +15,20 @@ internal abstract class SqlDialectBuilder
     protected const string PseudoTableInserted = "INSERTED";
     protected const string PseudoTableExcluded = "EXCLUDED";
 
+    private ISqlGenerationHelper? _sqlGenerationHelper;
+
     protected abstract string OpenDelimiter { get; }
     protected abstract string CloseDelimiter { get; }
+
+    /// <summary>
+    /// Provides the provider's <see cref="ISqlGenerationHelper"/> so identifier delimiting follows the
+    /// exact EF Core conventions (case preservation, embedded-delimiter escaping) instead of the
+    /// hardcoded delimiters. Safe to call repeatedly: the helper is functionally constant per provider.
+    /// </summary>
+    public void UseSqlGenerationHelper(ISqlGenerationHelper sqlGenerationHelper)
+    {
+        _sqlGenerationHelper = sqlGenerationHelper;
+    }
 
     protected virtual string ConcatOperator => "||";
 
@@ -192,18 +205,26 @@ internal abstract class SqlDialectBuilder
     protected virtual string GetExcludedColumnName(string columnName) => $"{PseudoTableExcluded}.{Quote(columnName)}";
 
     /// <summary>
-    /// Quotes a column name using database-specific delimiters.
+    /// Quotes a column name using the EF Core <see cref="ISqlGenerationHelper"/> when available
+    /// (preserving case and escaping embedded delimiters), otherwise the dialect delimiters.
     /// </summary>
     public string Quote(string entity)
     {
-        return $"{OpenDelimiter}{entity}{CloseDelimiter}";
+        return _sqlGenerationHelper?.DelimitIdentifier(entity)
+            ?? $"{OpenDelimiter}{entity}{CloseDelimiter}";
     }
 
     /// <summary>
-    /// Quotes a schema and table name using database-specific delimiters.
+    /// Quotes a schema and table name using the EF Core <see cref="ISqlGenerationHelper"/> when
+    /// available, otherwise the dialect delimiters.
     /// </summary>
     public string QuoteTableName(string? schema, string tableName)
     {
+        if (_sqlGenerationHelper != null)
+        {
+            return _sqlGenerationHelper.DelimitIdentifier(tableName, schema);
+        }
+
         return schema != null ? $"{Quote(schema)}.{Quote(tableName)}" : Quote(tableName);
     }
 

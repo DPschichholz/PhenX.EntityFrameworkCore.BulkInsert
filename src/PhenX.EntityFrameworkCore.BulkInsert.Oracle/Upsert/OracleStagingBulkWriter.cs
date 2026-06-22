@@ -42,11 +42,15 @@ internal sealed class OracleStagingBulkWriter
             }
         };
 
-        bulkCopy.ColumnMappings.Add(OracleGttColumns.BatchId, gtt.BatchIdColumn.ColumnName);
-        bulkCopy.ColumnMappings.Add(OracleGttColumns.ClientRowId, gtt.ClientRowIdColumn.ColumnName);
+        // The GTT is created with quoted (case-sensitive) column identifiers, so the bulk copy
+        // destination columns must also be quoted. Passing them unquoted makes ODP.NET emit the
+        // identifiers verbatim, which Oracle then folds to upper case (e.g. "test_run" -> TEST_RUN),
+        // raising ORA-00904 for any column whose model name is not already upper case.
+        bulkCopy.ColumnMappings.Add(OracleGttColumns.BatchId, QuoteColumn(gtt.BatchIdColumn.ColumnName));
+        bulkCopy.ColumnMappings.Add(OracleGttColumns.ClientRowId, QuoteColumn(gtt.ClientRowIdColumn.ColumnName));
         foreach (var column in payloadColumns)
         {
-            bulkCopy.ColumnMappings.Add(column.PropertyName, column.ColumnName);
+            bulkCopy.ColumnMappings.Add(column.PropertyName, QuoteColumn(column.ColumnName));
         }
 
         using var reader = new OracleStagingDataReader<T>(entities, payloadColumns, batchId, options);
@@ -64,5 +68,9 @@ internal sealed class OracleStagingBulkWriter
             bulkCopy.Close();
         }
     }
+
+    // Quotes a GTT column identifier the same way OracleGttSetupSqlGenerator creates it, so the bulk
+    // copy references the exact, case-sensitive column name.
+    private static string QuoteColumn(string columnName) => $"\"{columnName}\"";
 }
 

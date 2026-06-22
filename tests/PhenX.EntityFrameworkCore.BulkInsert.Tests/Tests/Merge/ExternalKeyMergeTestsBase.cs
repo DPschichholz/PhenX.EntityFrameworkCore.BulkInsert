@@ -112,7 +112,7 @@ public abstract class ExternalKeyMergeTestsBase<TDbContext>(IDbContextFactory db
             Name = "Original",
         };
         _context.TestEntitiesWithExternalKey.Add(existing);
-        _context.SaveChanges();
+        await _context.SaveChangesAsync();
         _context.ChangeTracker.Clear();
 
         var entities = new List<TestEntityWithExternalKey>
@@ -132,7 +132,6 @@ public abstract class ExternalKeyMergeTestsBase<TDbContext>(IDbContextFactory db
                 Match = e => new { e.ExternalId },
                 Update = (inserted, excluded) => new TestEntityWithExternalKey
                 {
-                    Id = TestHelpers.NewId(),
                     Name = excluded.Name,
                 },
             });

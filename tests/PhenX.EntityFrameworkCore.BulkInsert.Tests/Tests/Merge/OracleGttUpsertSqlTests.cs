@@ -45,7 +45,7 @@ public class OracleGttUpsertSqlTests
 
         var sql = new OracleGttSetupSqlGenerator().BuildCreateTableSql(gtt);
 
-        sql.Should().Contain("CREATE GLOBAL TEMPORARY TABLE");
+        sql.Should().Contain("CREATE PRIVATE TEMPORARY TABLE");
         sql.Should().Contain("ON COMMIT PRESERVE ROWS");
         sql.Should().Contain("\"BATCH_ID\" RAW(16) NOT NULL");
         sql.Should().Contain("\"CLIENT_ROW_ID\" NUMBER(19) NOT NULL");
@@ -234,7 +234,32 @@ public class OracleGttUpsertSqlTests
 
         entities[0].Id.Should().Be(expected);
     }
+
+    [Theory]
+    [InlineData("Products", "BULK_Products_STG")]
+    [InlineData("products", "BULK_products_STG")]
+    [InlineData("MixedCaseTable", "BULK_MixedCaseTable_STG")]
+    public void GetStagingTableName_PreservesTargetTableCase(string targetTableName, string expected)
+    {
+        using var context = CreateContext();
+        var dialect = (OracleDialectBuilder)context.GetService<IBulkInsertProvider>().SqlDialect;
+        var provider = new OracleGlobalTemporaryTableMetadataProvider(dialect);
+
+        // The GTT name must follow the EF Core model's identifier case instead of being force-folded
+        // to upper case, which previously broke quoted (case-sensitive) Oracle identifiers.
+        provider.GetStagingTableName(targetTableName).Should().Be(expected);
+    }
+
+    [Fact]
+    public void GttSetup_QuotesStagingTableName_PreservingModelCase()
+    {
+        using var context = CreateContext();
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var gtt = BuildGtt(context, tableInfo);
+
+        var sql = new OracleGttSetupSqlGenerator().BuildCreateTableSql(gtt);
+
+        // The quoted GTT name keeps the target table's case and is delimited via EF Core conventions.
+        sql.Should().Contain($"CREATE PRIVATE TEMPORARY TABLE \"BULK_{tableInfo.TableName}_STG\"");
+    }
 }
-
-
-
