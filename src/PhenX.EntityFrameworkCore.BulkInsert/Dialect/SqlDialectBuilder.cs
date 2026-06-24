@@ -491,7 +491,7 @@ internal abstract class SqlDialectBuilder
 
         if (underlyingType == typeof(bool))
         {
-            return (bool)value ? "TRUE" : "FALSE";
+            return FormatBool((bool)value);
         }
 
         // Numeric and other formattable values must use the invariant culture so that, for example,
@@ -510,6 +510,13 @@ internal abstract class SqlDialectBuilder
     /// that store GUIDs as binary (e.g. Oracle RAW(16)) must override this.
     /// </summary>
     protected virtual string FormatGuid(Guid value) => $"'{value}'";
+
+    /// <summary>
+    /// Formats a <see cref="bool"/> constant as the numeric literals <c>1</c>/<c>0</c>, which are valid
+    /// across all supported providers (including Oracle, which has no native SQL boolean type before 23c
+    /// and maps <see cref="bool"/> to NUMBER(1)).
+    /// </summary>
+    private static string FormatBool(bool value) => value ? "1" : "0";
 
     /// <summary>
     /// Determines whether an expression references any parameter expression, meaning it cannot be

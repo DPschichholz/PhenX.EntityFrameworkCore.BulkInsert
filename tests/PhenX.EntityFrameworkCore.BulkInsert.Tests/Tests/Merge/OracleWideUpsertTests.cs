@@ -111,5 +111,39 @@ public class OracleWideUpsertTests(TestDbContainerOracle dbContainer) : IAsyncLi
         persistedB.Id.Should().Be(inserted.Id);
         persistedB.String5.Should().Be("s5_2");
     }
+
+    [SkippableFact]
+    public async Task Upsert_WithConstantBool_EmitsNumericLiteral_AndUpdates()
+    {
+        // Arrange - seed an existing row whose boolean column is FALSE so the constant update is observable.
+        var existing = NewEntity("C", 1);
+        existing.Bool1 = false;
+        _context.Set<OracleWideUpsertEntity>().Add(existing);
+        await _context.SaveChangesAsync();
+        _context.ChangeTracker.Clear();
+
+        var batch = new List<OracleWideUpsertEntity>
+        {
+            NewEntity("C", 21), // same Code -> update existing
+        };
+
+        // Act - the Update expression assigns a constant 'true', which must be emitted as the Oracle
+        // numeric literal 1 (not the SQL standard TRUE, which is invalid on Oracle 21c / NUMBER(1)).
+        await _context.ExecuteBulkInsertAsync(
+            batch,
+            new OnConflictOptions<OracleWideUpsertEntity>
+            {
+                Match = e => new { e.Code },
+                Update = (inserted, excluded) => new OracleWideUpsertEntity
+                {
+                    Bool1 = true,
+                },
+            });
+
+        // Assert - the constant boolean was applied.
+        _context.ChangeTracker.Clear();
+        var persisted = _context.Set<OracleWideUpsertEntity>().Single(e => e.Code == $"{_run}_C");
+        persisted.Bool1.Should().BeTrue();
+    }
 }
 
