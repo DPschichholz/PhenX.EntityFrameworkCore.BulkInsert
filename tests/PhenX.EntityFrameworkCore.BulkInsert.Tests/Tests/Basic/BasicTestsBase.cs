@@ -79,7 +79,7 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableFact]
     public async Task InsertEntities_AndReturn_AsyncEnumerable()
     {
-        Skip.If(_context.IsProvider(ProviderType.MySql, ProviderType.Oracle));
+        Skip.If(_context.IsProvider(ProviderType.MySql));
 
         // Arrange
         var entities = new List<TestEntity>
@@ -216,6 +216,10 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [CombinatorialData]
     public async Task InsertEntities_WithOpenTransaction_RollsBackOnFailure(InsertStrategy strategy)
     {
+        // Oracle: the ReturnEntities / conflict paths use a temporary table created and dropped via DDL,
+        // and DDL issues an implicit COMMIT, so the rows cannot be rolled back. See docs/limitations.md.
+        Skip.If(_context.IsProvider(ProviderType.Oracle) && strategy is InsertStrategy.InsertReturn or InsertStrategy.InsertReturnAsync);
+
         // Arrange
         var entities = new List<TestEntity>
         {
@@ -320,6 +324,72 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
         // Assert - all fields including the application-assigned Guid Id should be preserved
         insertedEntities.Should().BeEquivalentTo(entities,
             o => o.RespectingRuntimeTypes());
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
+    public async Task InsertEntities_RunsClientSideValueGenerator(InsertStrategy strategy)
+    {
+        // Arrange - Ids are left unset so the configured value generator must populate them.
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities);
+
+        // Assert - the value generator produced unique, non-empty keys (no PK violation)...
+        insertedEntities.Should().HaveCount(2);
+        insertedEntities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        insertedEntities.Select(e => e.Id).Should().OnlyHaveUniqueItems();
+
+        // ...and the generated values were written back onto the source entities.
+        entities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        entities.Select(e => e.Id).Should().BeEquivalentTo(insertedEntities.Select(e => e.Id));
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
+    public async Task InsertEntities_RunsValueGenerator_WithCopyGeneratedColumns(InsertStrategy strategy)
+    {
+        // Arrange
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities,
+            o => o.CopyGeneratedColumns = true);
+
+        // Assert
+        insertedEntities.Should().HaveCount(2);
+        insertedEntities.Should().OnlyContain(e => e.Id != Guid.Empty);
+        insertedEntities.Select(e => e.Id).Should().OnlyHaveUniqueItems();
+        entities.Select(e => e.Id).Should().BeEquivalentTo(insertedEntities.Select(e => e.Id));
+    }
+
+    [SkippableTheory]
+    [CombinatorialData]
+    public async Task InsertEntities_ValueGenerator_PreservesExplicitlySetIds(InsertStrategy strategy)
+    {
+        // Arrange - when an Id is explicitly set (not the sentinel), the generator must not override it.
+        var explicitId1 = TestHelpers.NewId();
+        var explicitId2 = TestHelpers.NewId();
+        var entities = new List<TestEntityWithGeneratedGuidId>
+        {
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Id = explicitId1, Name = $"{_run}_Entity1" },
+            new TestEntityWithGeneratedGuidId { TestRun = _run, Id = explicitId2, Name = $"{_run}_Entity2" }
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities);
+
+        // Assert
+        insertedEntities.Select(e => e.Id).Should().BeEquivalentTo([explicitId1, explicitId2]);
     }
 
     [SkippableTheory]
@@ -473,8 +543,7 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableTheory]
     [CombinatorialData]
     public async Task InsertsEntities_WithComplexType(InsertStrategy strategy)
-    {
-        // Arrange
+    {        // Arrange
         var entities = new List<TestEntityWithComplexType>
         {
             new TestEntityWithComplexType
@@ -505,5 +574,50 @@ public abstract class BasicTestsBase<TDbContext>(IDbContextFactory dbContextFact
         // Assert
         insertedEntities.Should().BeEquivalentTo(entities,
             o => o.RespectingRuntimeTypes().Excluding(e => e.Id));
+    }
+
+    [SkippableFact]
+    public async Task InsertEntities_WhenCancelled_DoesNotLeaveLockOrSession()
+    {
+        // MySql does not observe cancellation the same way; the bulk copy abort hook is provider-specific.
+        Skip.If(_context.IsProvider(ProviderType.MySql));
+
+        // Arrange - enough rows so that cancellation can trigger at a batch boundary before completion.
+        const int count = 100_000;
+        var entities = Enumerable.Range(1, count).Select(i => new TestEntity
+        {
+            TestRun = _run,
+            Name = $"{_run}_Cancel{i}",
+        }).ToList();
+
+        using var cts = new CancellationTokenSource();
+
+        // Act - cancel as soon as the first batch is reported, then ensure the operation is aborted.
+        var act = async () =>
+        {
+            await _context.ExecuteBulkInsertAsync(entities, o =>
+            {
+                o.NotifyProgressAfter = 1;
+                o.OnProgress = _ => cts.Cancel();
+            }, cancellationToken: cts.Token);
+        };
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+
+        _context.ChangeTracker.Clear();
+
+        // Assert - a follow-up operation on the same table must complete promptly, proving that no
+        // table lock / server session was left hanging by the cancelled direct-path / bulk load.
+        using var followUpCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var followUp = new List<TestEntity>
+        {
+            new TestEntity { TestRun = _run, Name = $"{_run}_AfterCancel" },
+        };
+
+        await _context.ExecuteBulkInsertAsync(followUp, _ => { }, cancellationToken: followUpCts.Token);
+
+        _context.ChangeTracker.Clear();
+        var persisted = _context.TestEntities.Where(x => x.TestRun == _run && x.Name == $"{_run}_AfterCancel").ToList();
+        persisted.Should().ContainSingle();
     }
 }

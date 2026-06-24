@@ -55,6 +55,42 @@ public class OracleMergeSqlTests
         sql.Should().Contain("MERGE INTO");
         sql.TrimEnd().Should().NotEndWith(";");
     }
+
+    [Fact]
+    public void BuildMoveDataSql_ConflictUpdateWithWhere_UsesTrailingWhereNotWhenMatchedAnd()
+    {
+        using var context = CreateContext();
+
+        var provider = context.GetService<IBulkInsertProvider>();
+        var tableInfo = new MetadataProvider().GetTableInfo<TestEntity>(context);
+        var insertedColumns = tableInfo.GetColumns(includeGenerated: false);
+
+        var onConflict = new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Price = excluded.Price },
+            // A conditional update: Oracle expresses this as a trailing WHERE after SET, not as
+            // "WHEN MATCHED AND <condition> THEN" (which raises ORA-02000 "missing THEN keyword").
+            Where = (inserted, excluded) => excluded.Price > inserted.Price,
+        };
+
+        var sql = provider.SqlDialect.BuildMoveDataSql<TestEntity>(
+            context,
+            tableInfo,
+            "source_temp",
+            insertedColumns,
+            [],
+            new OracleBulkInsertOptions(),
+            onConflict);
+
+        sql.Should().Contain("WHEN MATCHED THEN UPDATE SET");
+        sql.Should().NotContain("WHEN MATCHED AND");
+        // The condition is emitted as a trailing WHERE clause of the update.
+        System.Text.RegularExpressions.Regex
+            .IsMatch(sql, @"UPDATE\s+SET[\s\S]*?WHERE")
+            .Should().BeTrue("the update condition must be a trailing WHERE clause");
+    }
 }
+
 
 

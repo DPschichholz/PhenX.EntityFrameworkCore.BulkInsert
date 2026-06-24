@@ -127,6 +127,33 @@ await dbContext.ExecuteBulkInsertAsync(entities, o =>
 await dbContext.ExecuteBulkInsertReturnEntitiesAsync(entities);
 ```
 
+### Client-side value generators
+
+Properties configured with a client-side value generator (`HasValueGenerator<T>()` + `ValueGeneratedOnAdd()`)
+are populated by the library during bulk insert for any entity whose value is still the property sentinel
+(not explicitly set). The generated value is written back onto the source entity, matching EF Core's
+`SaveChanges` behavior, and works across all providers (SQL Server, PostgreSQL, SQLite, MySQL, Oracle 21c+).
+
+```csharp
+modelBuilder.Entity<Product>(e =>
+{
+    e.Property(p => p.Id)
+        .ValueGeneratedOnAdd()
+        .HasValueGenerator<GuidV7ValueGenerator>();
+});
+
+// Ids left unset are filled by the generator (unique values, no PK violation).
+await dbContext.ExecuteBulkInsertAsync(products);
+```
+
+Database-generated values and EF Core's implicit generators (such as the default `Guid` key generator
+without an explicit `HasValueGenerator`) are not handled — assign those values yourself before inserting.
+
+> Because bulk insert bypasses the change tracker, no `EntityEntry` is available. Value generators that
+> derive their value from the entry (e.g. computing an Id from other properties via `entry.Entity`) are
+> not supported and throw a `NotSupportedException`; use a generator that only produces a value, or set
+> the value explicitly before inserting.
+
 ### Logging
 
 Bulk insert operations emit EF Core-style logs when a logger factory is configured on the `DbContext` options:
@@ -154,6 +181,7 @@ a conflict is detected (e.g., update existing rows), using the `onConflict` para
  * The conflicting columns are specified with the `Match` property and must have a unique constraint in the database.
  * The action to take when a conflict is detected is specified with the `Update` property. If not specified, the default action is to do nothing (i.e., skip the conflicting rows).
  * You can also specify the condition for the update action using either the `Where` or the `RawWhere` property. If not specified, the update action will be applied to all conflicting rows.
+ * Primary key and `Match` columns are never overwritten by the update action, even if they are assigned in the `Update` expression. The primary key of a matched (updated) row always keeps its existing value.
 
 ```csharp
 await dbContext.ExecuteBulkInsertAsync(entities, onConflict: new OnConflictOptions<TestEntity>

@@ -28,6 +28,18 @@ public class Program
             typeof(LibComparatorOracle),
         };
 
-        BenchmarkRunner.Run(comparators, config);
+        // Upsert / merge (conflict resolution) comparison benchmarks
+        var upsertComparators = new[]
+        {
+#if MYSQL_SUPPORTED
+            typeof(UpsertComparatorMySql),
+#endif
+            typeof(UpsertComparatorPostgreSql),
+            typeof(UpsertComparatorSqlite),
+            typeof(UpsertComparatorSqlServer),
+            typeof(UpsertComparatorOracle),
+        };
+
+        BenchmarkRunner.Run([..comparators, ..upsertComparators], config);
     }
 }

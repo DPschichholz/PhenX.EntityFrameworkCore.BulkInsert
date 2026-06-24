@@ -128,8 +128,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_SingleColumn(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run,Name = $"{_run}_Entity1" });
@@ -237,14 +235,46 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
         Assert.Contains(insertedEntities, e => e.Name == $"{_run}_Entity1" && e.Price == 30);
     }
 
+    [SkippableFact]
+    public async Task BulkInsert_WithConflict_ConditionalUpdate_AppliesWhereOnMerge()
+    {
+        // Exercises the conflict-resolution path without returning entities (Oracle MERGE etc.).
+        // The conditional update must be applied as a trailing WHERE; on Oracle, generating
+        // "WHEN MATCHED AND <condition> THEN" previously raised ORA-02000 ("missing THEN keyword").
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity2", Price = 10 });
+        _context.SaveChanges();
+        _context.ChangeTracker.Clear();
+
+        var entities = new List<TestEntity>
+        {
+            // Higher price -> condition (excluded.Price > inserted.Price) holds -> updated.
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 20 },
+            // Lower price -> condition does not hold -> kept at original price.
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity2", Price = 5 },
+        };
+
+        await _context.ExecuteBulkInsertAsync(entities, onConflict: new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Price = excluded.Price },
+            Where = (inserted, excluded) => excluded.Price > inserted.Price,
+        });
+
+        _context.ChangeTracker.Clear();
+        var entity1 = _context.TestEntities.Single(e => e.TestRun == _run && e.Name == $"{_run}_Entity1");
+        var entity2 = _context.TestEntities.Single(e => e.TestRun == _run && e.Name == $"{_run}_Entity2");
+
+        entity1.Price.Should().Be(20);
+        entity2.Price.Should().Be(10);
+    }
+
     [SkippableTheory]
     [InlineData(InsertStrategy.InsertReturn)]
     [InlineData(InsertStrategy.InsertReturnAsync)]
     public async Task InsertEntities_WithConflict_ExpressionCondition(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -288,8 +318,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_ComplexExpressionCondition(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -322,8 +350,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithConflict_MultipleColumns(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
@@ -352,11 +378,42 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableTheory]
     [InlineData(InsertStrategy.InsertReturn)]
     [InlineData(InsertStrategy.InsertReturnAsync)]
+    public async Task InsertEntities_WithConflict_UpdateGuidColumn(InsertStrategy strategy)
+    {
+        Skip.If(_context.IsProvider(ProviderType.MySql));
+
+        // Arrange - existing row to conflict with (matched on the unique Name column)
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Identifier = Guid.NewGuid() });
+        _context.SaveChanges();
+        _context.ChangeTracker.Clear();
+
+        // A constant Guid emitted as a literal into the UPDATE SET clause. On Oracle the column is
+        // RAW(16); a dashed string literal would fail with ORA-01465, so this guards the HEXTORAW path.
+        var newIdentifier = TestHelpers.NewId();
+
+        var entities = new List<TestEntity>
+        {
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Identifier = Guid.NewGuid() },
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities, _ => {}, new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Identifier = newIdentifier },
+        });
+
+        // Assert - the matched row's Guid column was updated to the constant value, no ORA-01465
+        Assert.Single(insertedEntities);
+        Assert.Equal(newIdentifier, insertedEntities[0].Identifier);
+    }
+
+    [SkippableTheory]
+    [InlineData(InsertStrategy.InsertReturn)]
+    [InlineData(InsertStrategy.InsertReturnAsync)]
     public async Task InsertEntities_WithComplexType_UpdateAll(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange
         var entities = new List<TestEntityWithComplexType>
@@ -409,8 +466,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithComplexType_UpdateWithWhere(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange - initial Code values are 10 and 20
         var entities = new List<TestEntityWithComplexType>
@@ -462,8 +517,6 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     public async Task InsertEntities_WithComplexType_UpdateComplexPropertyConditionally(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));
-        // Oracle MERGE does not support returning entities
-        Skip.If(_context.IsProvider(ProviderType.Oracle));
 
         // Arrange - Create entities with different Code values
         var entities = new List<TestEntityWithComplexType>

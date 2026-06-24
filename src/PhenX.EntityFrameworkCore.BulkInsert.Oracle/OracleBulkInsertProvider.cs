@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 using JetBrains.Annotations;
 
 using Microsoft.EntityFrameworkCore;
@@ -7,41 +9,98 @@ using Oracle.ManagedDataAccess.Client;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Metadata;
 using PhenX.EntityFrameworkCore.BulkInsert.Options;
+using PhenX.EntityFrameworkCore.BulkInsert.Oracle.Upsert;
 
 namespace PhenX.EntityFrameworkCore.BulkInsert.Oracle;
 
 [UsedImplicitly]
 internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkInsertProviderBase<OracleDialectBuilder, OracleBulkInsertOptions>(loggerFactory)
 {
+    private readonly OracleBatchUpsertService _upsertService = new();
+
     /// <inheritdoc />
     protected override string BulkInsertId => "ROWID";
 
     /// <inheritdoc />
     protected override string AddTableCopyBulkInsertId => ""; // No need to add an ID column in Oracle
 
-    /// <inheritdoc />
-    /// <summary>
-    /// The temporary table name is generated with a random 8-character suffix to ensure uniqueness, and is limited to less than 30 characters,
-    /// because Oracle prior to 12.2 has a limit of 30 characters for identifiers.
-    /// </summary>
-    protected override string GetTempTableName(string tableName) => $"#temp_bulk_insert_{Helpers.RandomString(8)}";
-
     protected override OracleBulkInsertOptions CreateDefaultOptions() => new()
     {
         BatchSize = 50_000,
     };
 
-    /// <inheritdoc />
-    protected override IAsyncEnumerable<T> BulkInsertReturnEntities<T>(
+    /// <summary>
+    /// Returns inserted/updated entities via the GTT MERGE/INSERT + REF CURSOR pipeline, writing the
+    /// generated values back onto the originating instances by CLIENT_ROW_ID before yielding them.
+    /// </summary>
+    protected override async IAsyncEnumerable<T> BulkInsertReturnEntities<T>(
         bool sync,
         DbContext context,
         TableMetadata tableInfo,
         IEnumerable<T> entities,
         OracleBulkInsertOptions options,
         OnConflictOptions<T>? onConflict,
-        CancellationToken ctk)
+        [EnumeratorCancellation] CancellationToken ctk) where T : class
     {
-        throw new NotSupportedException("Provider does not support returning entities.");
+        using var activity = Telemetry.ActivitySource.StartActivity("BulkInsertReturnEntities");
+        activity?.AddTag("tableName", tableInfo.TableName);
+        activity?.AddTag("synchronous", sync);
+
+        ValidateOptions(options);
+
+        var list = entities as IReadOnlyList<T> ?? entities.ToList();
+
+        await _upsertService.RunAsync(
+            sync, context, SqlDialect, tableInfo, list, options, onConflict, returnEntities: true, ctk);
+
+        foreach (var item in list)
+        {
+            yield return item;
+        }
+    }
+
+    /// <summary>
+    /// Performs a bulk insert (direct-path) or a bulk upsert (GTT MERGE + REF CURSOR) without
+    /// returning entities.
+    /// </summary>
+    protected override async Task BulkInsert<T>(
+        bool sync,
+        DbContext context,
+        TableMetadata tableInfo,
+        IEnumerable<T> entities,
+        OracleBulkInsertOptions options,
+        OnConflictOptions<T>? onConflict,
+        CancellationToken ctk) where T : class
+    {
+        ValidateOptions(options);
+
+        // A plain insert (no conflict resolution) keeps using the direct-path bulk copy into the
+        // target table; only the upsert path goes through the GTT MERGE/REF CURSOR pipeline.
+        if (onConflict == null)
+        {
+            await base.BulkInsert(sync, context, tableInfo, entities, options, onConflict, ctk);
+            return;
+        }
+
+        using var activity = Telemetry.ActivitySource.StartActivity("BulkUpsert");
+        activity?.AddTag("tableName", tableInfo.TableName);
+        activity?.AddTag("synchronous", sync);
+
+        var list = entities as IReadOnlyList<T> ?? entities.ToList();
+
+        await _upsertService.RunAsync(
+            sync, context, SqlDialect, tableInfo, list, options, onConflict, returnEntities: false, ctk);
+    }
+
+    private static void ValidateOptions(OracleBulkInsertOptions options)
+    {
+        // MoveRows deletes from the source after copying; it has no meaning for the session-local
+        // staging GTT and is unsupported for Oracle.
+        if (options.MoveRows)
+        {
+            throw new NotSupportedException(
+                "MoveRows is not supported for Oracle. The bulk pipeline stages rows in a Global Temporary Table.");
+        }
     }
 
     /// <inheritdoc />
@@ -55,7 +114,7 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         OracleBulkInsertOptions options,
         CancellationToken ctk)
     {
-        var connection = (OracleConnection) context.Database.GetDbConnection();
+        var connection = (OracleConnection)context.Database.GetDbConnection();
 
         using var bulkCopy = new OracleBulkCopy(connection, options.CopyOptions);
 
@@ -76,33 +135,25 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
         bulkCopy.BatchSize = options.BatchSize;
         bulkCopy.BulkCopyTimeout = options.GetCopyTimeoutInSeconds();
 
-        // Handle progress notifications
-        if (options is { NotifyProgressAfter: not null, OnProgress: not null })
+        // OracleBulkCopy only evaluates cancellation in the OracleRowsCopied event, which fires
+        // every NotifyAfter rows. A value must always be set (even without progress callback) so
+        // that cancellation is observed promptly instead of only at the end of the whole load.
+        bulkCopy.NotifyAfter = options.NotifyProgressAfter ?? options.BatchSize;
+
+        var hasProgress = options is { NotifyProgressAfter: not null, OnProgress: not null };
+
+        bulkCopy.OracleRowsCopied += (_, e) =>
         {
-            bulkCopy.NotifyAfter = options.NotifyProgressAfter.Value;
-
-            bulkCopy.OracleRowsCopied += (sender, e) =>
+            if (hasProgress)
             {
-                options.OnProgress(e.RowsCopied);
+                options.OnProgress!(e.RowsCopied);
+            }
 
-                if (ctk.IsCancellationRequested)
-                {
-                    e.Abort = true;
-                }
-            };
-        }
-
-        // If no progress notification is set, we still need to handle cancellation.
-        else
-        {
-            bulkCopy.OracleRowsCopied += (sender, e) =>
+            if (ctk.IsCancellationRequested)
             {
-                if (ctk.IsCancellationRequested)
-                {
-                    e.Abort = true;
-                }
-            };
-        }
+                e.Abort = true;
+            }
+        };
 
         foreach (var column in columns)
         {
@@ -111,25 +162,31 @@ internal class OracleBulkInsertProvider(ILoggerFactory? loggerFactory) : BulkIns
 
         var dataReader = new EnumerableDataReader<T>(entities, columns, options);
 
-        bulkCopy.WriteToServer(dataReader);
+        try
+        {
+            bulkCopy.WriteToServer(dataReader);
+        }
+        catch
+        {
+            // OracleBulkCopy runs a direct-path load that does NOT enlist in the EF transaction and
+            // holds an exclusive (TM) lock on the destination table. When the load is aborted (via
+            // e.Abort on cancellation) ODP.NET throws; surface a clean cancellation in that case.
+            if (ctk.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(ctk);
+            }
+
+            throw;
+        }
+        finally
+        {
+            // Explicitly close the bulk copy so the direct-path stream is finalized and the table
+            // lock / server session is released before the object is disposed. Without this an
+            // aborted load can leave a lock or session hanging on the server.
+            bulkCopy.Close();
+        }
 
         return Task.CompletedTask;
     }
-
-    /// <inheritdoc />
-    protected override async Task DropTempTableAsync(bool sync, DbContext dbContext, string tableName)
-    {
-        var commandText = $"""
-                           BEGIN
-                               EXECUTE IMMEDIATE 'DROP TABLE {tableName}';
-                           EXCEPTION
-                               WHEN OTHERS THEN
-                                   IF SQLCODE != -942 THEN -- ORA-00942: table or view does not exist
-                                       RAISE;
-                                   END IF;
-                           END;
-                           """;
-
-        await ExecuteAsync(sync, dbContext, commandText, CancellationToken.None);
-    }
 }
+

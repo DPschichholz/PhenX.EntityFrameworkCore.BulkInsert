@@ -38,6 +38,7 @@ internal abstract class BulkInsertProviderBase<TDialect, TOptions>(ILoggerFactor
         activity?.AddTag("synchronous", sync);
 
         var connection = await context.GetConnection(sync, ctk);
+        var committed = false;
         try
         {
             if (logger != null)
@@ -64,9 +65,17 @@ internal abstract class BulkInsertProviderBase<TDialect, TOptions>(ILoggerFactor
 
             // Commit the transaction if we own them.
             await connection.Commit(sync, ctk);
+            committed = true;
         }
         finally
         {
+            // On cancellation/failure (commit not reached), roll back our own transaction first to
+            // release server-side locks promptly instead of relying on the dispose in Close.
+            if (!committed)
+            {
+                await connection.Rollback(sync);
+            }
+
             await connection.Close(sync, ctk);
         }
     }
@@ -121,6 +130,12 @@ internal abstract class BulkInsertProviderBase<TDialect, TOptions>(ILoggerFactor
 
             // Commit the transaction if we own them.
             await connection.Commit(sync, ctk);
+        }
+        catch
+        {
+            // Roll back our own transaction on cancellation/failure to release server-side locks promptly.
+            await connection.Rollback(sync);
+            throw;
         }
         finally
         {

@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using PhenX.EntityFrameworkCore.BulkInsert.Dialect;
 using PhenX.EntityFrameworkCore.BulkInsert.Metadata;
 using PhenX.EntityFrameworkCore.BulkInsert.Options;
+using PhenX.EntityFrameworkCore.BulkInsert.Oracle.Upsert;
 
 namespace PhenX.EntityFrameworkCore.BulkInsert.Oracle;
 
@@ -15,6 +16,14 @@ internal class OracleDialectBuilder : SqlDialectBuilder
     protected override string ConcatOperator => "||";
 
     protected override bool SupportsMoveRows => false;
+
+    // Oracle has no BTRIM function (PostgreSQL-specific); the ANSI TRIM removes leading and trailing spaces.
+    protected override string Trim(string lhs) => $"TRIM({lhs})";
+
+    // Oracle (EF Core / ODP.NET) stores System.Guid as RAW(16). A dashed string literal would be
+    // implicitly converted via HEXTORAW and fail with ORA-01465 ("invalid hex number"). Emit an
+    // explicit HEXTORAW literal using the same byte order ODP.NET uses when reading/writing the value.
+    protected override string FormatGuid(Guid value) => $"HEXTORAW('{Convert.ToHexString(value.ToByteArray())}')";
 
     public override string CreateTableCopySql(string tempTableName, TableMetadata tableInfo, IReadOnlyList<ColumnMetadata> columns)
     {
@@ -93,32 +102,37 @@ internal class OracleDialectBuilder : SqlDialectBuilder
 
             if (onConflictTyped.Update != null)
             {
-                q.Append("WHEN MATCHED ");
-
-                if (onConflictTyped.RawWhere != null || onConflictTyped.Where != null)
+                if (onConflictTyped is { RawWhere: not null, Where: not null })
                 {
-                    if (onConflictTyped is { RawWhere: not null, Where: not null })
-                    {
-                        throw new ArgumentException("Cannot specify both RawWhere and Where in OnConflictOptions.");
-                    }
-
-                    q.Append("AND ");
-                    AppendConflictCondition(q, target, context, onConflictTyped);
+                    throw new ArgumentException("Cannot specify both RawWhere and Where in OnConflictOptions.");
                 }
 
-                q.AppendLine("THEN UPDATE SET ");
+                q.Append("WHEN MATCHED THEN UPDATE SET ");
                 // Oracle MERGE: columns in ON clause cannot be updated, so exclude match columns
                 // Use insertedColumns instead of all columns because the USING subquery only contains insertedColumns
                 var matchColumnSet = matchColumns.ToHashSet();
                 var updateableColumns = insertedColumns.Where(c => !matchColumnSet.Contains(c.QuotedColumName)).ToList();
-                if (updateableColumns.Count == 0)
+                // Match columns (ON clause) and primary key columns must never be overwritten by an upsert.
+                var updates = ExcludeNonUpdatableColumns(
+                    GetUpdates(context, target, updateableColumns, onConflictTyped.Update),
+                    target,
+                    matchColumns);
+                if (updates.Count == 0)
                 {
                     throw new InvalidOperationException(
-                        "Oracle MERGE cannot update any columns because all available columns are used in the ON clause for conflict detection. " +
-                        "Specify different columns in the 'Match' option or use specific columns in the 'Update' expression.");
+                        "Oracle MERGE cannot update any columns because all targeted columns are match or primary key columns. " +
+                        "Specify different columns in the 'Match' option or in the 'Update' expression.");
                 }
-                q.AppendJoin(", ", GetUpdates(context, target, updateableColumns, onConflictTyped.Update));
+                q.AppendJoin(", ", updates);
                 q.AppendLine();
+
+                // Oracle MERGE does not support "WHEN MATCHED AND <condition> THEN"; the update
+                // condition must be expressed as a trailing WHERE clause after the SET assignments.
+                if (onConflictTyped.RawWhere != null || onConflictTyped.Where != null)
+                {
+                    q.Append("WHERE ");
+                    AppendConflictCondition(q, target, context, onConflictTyped);
+                }
             }
         }
 
@@ -147,5 +161,187 @@ internal class OracleDialectBuilder : SqlDialectBuilder
         // Oracle executes these statements via ExecuteNonQuery as plain SQL, which must not end
         // with a statement terminator. A trailing ';' is only valid inside PL/SQL blocks.
         return q.ToString();
+    }
+    /// <summary>
+    /// Removes update assignments that target match columns or primary key columns. Oracle forbids
+    /// updating ON-clause (match) columns, and the primary key must never be overwritten by an upsert
+    /// (overwriting a RAW(16) GUID primary key additionally raises ORA-01465).
+    /// </summary>
+    private List<string> ExcludeNonUpdatableColumns(
+        IEnumerable<string> updateClauses,
+        TableMetadata target,
+        IEnumerable<string> matchColumns)
+    {
+        var excluded = new HashSet<string>(matchColumns);
+        foreach (var pk in target.PrimaryKey)
+        {
+            excluded.Add(pk.QuotedColumName);
+        }
+
+        return updateClauses
+            .Where(clause =>
+            {
+                var eq = clause.IndexOf(" = ", StringComparison.Ordinal);
+                var column = eq < 0 ? clause : clause[..eq];
+                return !excluded.Contains(column);
+            })
+            .ToList();
+    }
+
+    private const string OracleValueGenerationStrategyAnnotation = "Oracle:ValueGenerationStrategy";
+
+    /// <summary>
+    /// Adapter (Option C): maps <see cref="OnConflictOptions{T}"/> and EF Core metadata onto an
+    /// <see cref="OracleUpsertPlan"/> consumed by the GTT REF CURSOR SQL generators.
+    /// </summary>
+    internal OracleUpsertPlan BuildUpsertPlan<T>(
+        DbContext context,
+        TableMetadata target,
+        OracleGlobalTemporaryTableMetadata gtt,
+        IReadOnlyList<ColumnMetadata> payloadColumns,
+        IReadOnlyList<ColumnMetadata> insertableColumns,
+        OnConflictOptions<T>? onConflict,
+        IReadOnlyList<ColumnMetadata> returnedColumns) where T : class
+    {
+        IReadOnlyList<string> matchColumns;
+        if (onConflict?.Match != null)
+        {
+            matchColumns = GetColumns(target, onConflict.Match).ToList();
+        }
+        else if (target.PrimaryKey.Length > 0)
+        {
+            matchColumns = target.PrimaryKey.Select(x => x.QuotedColumName).ToList();
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "Table has no primary key. Specify a Match expression for conflict detection.");
+        }
+
+        var idColumn = target.PrimaryKey.Length == 1 ? target.PrimaryKey[0] : null;
+        var (idStrategy, sequenceName) = DetectIdStrategy(idColumn);
+
+        // Insertable (non store-generated) columns already exclude identity/sequence keys and computed
+        // columns. A client-generated key stays in the list and is inserted straight from staging.
+        var insertColumns = insertableColumns.ToList();
+
+        var updateClauses = BuildUpdateClauses(context, target, payloadColumns, matchColumns, onConflict);
+        var updateWhere = BuildUpdateWhere(context, target, onConflict);
+
+        return new OracleUpsertPlan
+        {
+            Gtt = gtt,
+            TargetQuotedTableName = target.QuotedTableName,
+            MatchColumns = matchColumns,
+            InsertColumns = insertColumns,
+            UpdateClauses = updateClauses,
+            UpdateWhere = updateWhere,
+            IdColumn = idColumn,
+            IdStrategy = idStrategy,
+            SequenceName = sequenceName,
+            ReturnedColumns = returnedColumns,
+        };
+    }
+
+    private List<string> BuildUpdateClauses<T>(
+        DbContext context,
+        TableMetadata target,
+        IReadOnlyList<ColumnMetadata> payloadColumns,
+        IReadOnlyList<string> matchColumns,
+        OnConflictOptions<T>? onConflict) where T : class
+    {
+        if (onConflict?.Update == null)
+        {
+            return [];
+        }
+
+        var matchColSet = matchColumns.ToHashSet();
+        var updateableCols = payloadColumns.Where(c => !matchColSet.Contains(c.QuotedColumName)).ToList();
+
+        return ExcludeNonUpdatableColumns(
+                GetUpdates(context, target, updateableCols, onConflict.Update),
+                target,
+                matchColumns)
+            .Select(expr => expr
+                .Replace($"{PseudoTableExcluded}.", "src.")
+                .Replace($"{PseudoTableInserted}.", "tgt."))
+            .ToList();
+    }
+
+    private string? BuildUpdateWhere<T>(
+        DbContext context,
+        TableMetadata target,
+        OnConflictOptions<T>? onConflict) where T : class
+    {
+        if (onConflict is not { } typed || (typed.RawWhere == null && typed.Where == null))
+        {
+            return null;
+        }
+
+        if (typed is { RawWhere: not null, Where: not null })
+        {
+            throw new ArgumentException("Cannot specify both RawWhere and Where in OnConflictOptions.");
+        }
+
+        var condSb = new StringBuilder();
+        AppendConflictCondition(condSb, target, context, typed);
+        return condSb.ToString().Trim()
+            .Replace($"{PseudoTableExcluded}.", "src.")
+            .Replace($"{PseudoTableInserted}.", "tgt.");
+    }
+
+    private static (OracleIdStrategy Strategy, string? SequenceName) DetectIdStrategy(ColumnMetadata? idColumn)
+    {
+        if (idColumn == null)
+        {
+            return (OracleIdStrategy.None, null);
+        }
+
+        var property = idColumn.Property;
+
+        // Oracle EF provider records identity vs. sequence via this annotation.
+        var strategy = property.FindAnnotation(OracleValueGenerationStrategyAnnotation)?.Value?.ToString();
+        if (string.Equals(strategy, "IdentityColumn", StringComparison.OrdinalIgnoreCase))
+        {
+            return (OracleIdStrategy.Identity, null);
+        }
+
+        // A sequence-backed default (e.g. "\"MY_SEQ\".NEXTVAL") yields a Sequence strategy.
+        var defaultSql = property.GetDefaultValueSql();
+        if (defaultSql != null && defaultSql.Contains("NEXTVAL", StringComparison.OrdinalIgnoreCase))
+        {
+            return (OracleIdStrategy.Sequence, ExtractSequenceName(defaultSql));
+        }
+
+        if (string.Equals(strategy, "SequenceHiLo", StringComparison.OrdinalIgnoreCase))
+        {
+            return (OracleIdStrategy.Sequence, null);
+        }
+
+        // Client-side keys: explicit value generator, or Guid/string keys generated on add.
+        var clrType = Nullable.GetUnderlyingType(idColumn.ClrType) ?? idColumn.ClrType;
+        if (property.GetValueGeneratorFactory() != null
+            || (property.ValueGenerated != Microsoft.EntityFrameworkCore.Metadata.ValueGenerated.Never
+                && (clrType == typeof(Guid) || clrType == typeof(string))))
+        {
+            return (OracleIdStrategy.ClientGenerated, null);
+        }
+
+        return (OracleIdStrategy.None, null);
+    }
+
+    private static string? ExtractSequenceName(string defaultSql)
+    {
+        // Handles forms like "\"SEQ\".NEXTVAL", "SCHEMA.\"SEQ\".NEXTVAL" and "SEQ.NEXTVAL".
+        var nextValIndex = defaultSql.IndexOf("NEXTVAL", StringComparison.OrdinalIgnoreCase);
+        if (nextValIndex <= 0)
+        {
+            return null;
+        }
+
+        var head = defaultSql[..nextValIndex].TrimEnd().TrimEnd('.').Trim();
+        var lastDot = head.LastIndexOf('.');
+        var token = lastDot >= 0 ? head[(lastDot + 1)..] : head;
+        return token.Trim().Trim('"');
     }
 }

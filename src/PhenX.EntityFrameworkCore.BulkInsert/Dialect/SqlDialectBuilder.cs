@@ -1,7 +1,9 @@
 using System.Linq.Expressions;
+using System.Globalization;
 using System.Text;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 using PhenX.EntityFrameworkCore.BulkInsert.Metadata;
 using PhenX.EntityFrameworkCore.BulkInsert.Options;
@@ -13,8 +15,20 @@ internal abstract class SqlDialectBuilder
     protected const string PseudoTableInserted = "INSERTED";
     protected const string PseudoTableExcluded = "EXCLUDED";
 
+    private ISqlGenerationHelper? _sqlGenerationHelper;
+
     protected abstract string OpenDelimiter { get; }
     protected abstract string CloseDelimiter { get; }
+
+    /// <summary>
+    /// Provides the provider's <see cref="ISqlGenerationHelper"/> so identifier delimiting follows the
+    /// exact EF Core conventions (case preservation, embedded-delimiter escaping) instead of the
+    /// hardcoded delimiters. Safe to call repeatedly: the helper is functionally constant per provider.
+    /// </summary>
+    public void UseSqlGenerationHelper(ISqlGenerationHelper sqlGenerationHelper)
+    {
+        _sqlGenerationHelper = sqlGenerationHelper;
+    }
 
     protected virtual string ConcatOperator => "||";
 
@@ -191,18 +205,26 @@ internal abstract class SqlDialectBuilder
     protected virtual string GetExcludedColumnName(string columnName) => $"{PseudoTableExcluded}.{Quote(columnName)}";
 
     /// <summary>
-    /// Quotes a column name using database-specific delimiters.
+    /// Quotes a column name using the EF Core <see cref="ISqlGenerationHelper"/> when available
+    /// (preserving case and escaping embedded delimiters), otherwise the dialect delimiters.
     /// </summary>
     public string Quote(string entity)
     {
-        return $"{OpenDelimiter}{entity}{CloseDelimiter}";
+        return _sqlGenerationHelper?.DelimitIdentifier(entity)
+            ?? $"{OpenDelimiter}{entity}{CloseDelimiter}";
     }
 
     /// <summary>
-    /// Quotes a schema and table name using database-specific delimiters.
+    /// Quotes a schema and table name using the EF Core <see cref="ISqlGenerationHelper"/> when
+    /// available, otherwise the dialect delimiters.
     /// </summary>
     public string QuoteTableName(string? schema, string tableName)
     {
+        if (_sqlGenerationHelper != null)
+        {
+            return _sqlGenerationHelper.DelimitIdentifier(tableName, schema);
+        }
+
         return schema != null ? $"{Quote(schema)}.{Quote(tableName)}" : Quote(tableName);
     }
 
@@ -289,6 +311,15 @@ internal abstract class SqlDialectBuilder
     /// <exception cref="NotSupportedException">Thrown when an expression could not be translated.</exception>
     private string ToSqlExpression<TEntity>(DbContext context, TableMetadata table, Expression expr, LambdaExpression? lambda = null)
     {
+        // Expressions that do not reference any lambda parameter (e.g. Guid.CreateVersion7(),
+        // DateTime.UtcNow, captured local variables) cannot be translated to SQL but are constant
+        // from the statement's point of view, so they are evaluated locally and emitted as literals.
+        if (expr is not ConstantExpression && expr is not ParameterExpression && !ReferencesParameter(expr))
+        {
+            var value = Expression.Lambda(expr).Compile().DynamicInvoke();
+            return FormatConstant(value);
+        }
+
         switch (expr)
         {
             case LambdaExpression memberExpr:
@@ -351,23 +382,7 @@ internal abstract class SqlDialectBuilder
                 }
 
             case ConstantExpression contantExpr:
-                if (contantExpr.Type == typeof(RawSqlValue) && contantExpr.Value != null)
-                {
-                    return ((RawSqlValue)contantExpr.Value!).Sql;
-                }
-
-                if (contantExpr.Type == typeof(string) ||
-                    contantExpr.Type == typeof(Guid))
-                {
-                    return $"'{contantExpr.Value}'";
-                }
-
-                if (contantExpr.Type == typeof(bool))
-                {
-                    return (bool)contantExpr.Value! ? "TRUE" : "FALSE";
-                }
-
-                return contantExpr.Value?.ToString() ?? "NULL";
+                return FormatConstant(contantExpr.Value);
 
             case UnaryExpression unaryExpr:
                 if (unaryExpr.NodeType == ExpressionType.Convert)
@@ -439,6 +454,61 @@ internal abstract class SqlDialectBuilder
                 // Simple property assignment - the column name is the property name
                 yield return $"{table.GetQuotedColumnName(binding.Member.Name)} = {ToSqlExpression<T>(context, table, binding.Expression, lambda)}";
             }
+        }
+    }
+
+    /// <summary>
+    /// Formats a constant value as an SQL literal.
+    /// </summary>
+    private string FormatConstant(object? value)
+    {
+        return value switch
+        {
+            null => "NULL",
+            RawSqlValue rawSqlValue => rawSqlValue.Sql,
+            Guid guid => FormatGuid(guid),
+            string s => $"'{s}'",
+            bool b => FormatBool(b),
+            // Numeric and other formattable values must use the invariant culture so that, for example,
+            // a decimal is rendered as "42.5" and not the culture-specific "42,5" which is invalid SQL.
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            _ => value.ToString() ?? "NULL",
+        };
+    }
+
+    /// <summary>
+    /// Formats a <see cref="Guid"/> constant as an SQL literal. The default renders the canonical
+    /// dashed string form (valid for providers that store GUIDs as text/uniqueidentifier). Providers
+    /// that store GUIDs as binary (e.g. Oracle RAW(16)) must override this.
+    /// </summary>
+    protected virtual string FormatGuid(Guid value) => $"'{value}'";
+
+    /// <summary>
+    /// Formats a <see cref="bool"/> constant as the numeric literals <c>1</c>/<c>0</c>, which are valid
+    /// across all supported providers (including Oracle, which has no native SQL boolean type before 23c
+    /// and maps <see cref="bool"/> to NUMBER(1)).
+    /// </summary>
+    protected virtual string FormatBool(bool value) => value ? "1" : "0";
+
+    /// <summary>
+    /// Determines whether an expression references any parameter expression, meaning it cannot be
+    /// evaluated locally as a constant.
+    /// </summary>
+    private static bool ReferencesParameter(Expression expr)
+    {
+        var visitor = new ParameterReferenceVisitor();
+        visitor.Visit(expr);
+        return visitor.Found;
+    }
+
+    private sealed class ParameterReferenceVisitor : ExpressionVisitor
+    {
+        public bool Found { get; private set; }
+
+        protected override Expression VisitParameter(ParameterExpression node)
+        {
+            Found = true;
+            return base.VisitParameter(node);
         }
     }
 
