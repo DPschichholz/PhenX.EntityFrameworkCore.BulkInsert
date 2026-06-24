@@ -109,6 +109,12 @@ produced on the client and inserted like any other column. Database-generated va
 implicit value generators (for example the default `Guid` key generator without an explicit
 `HasValueGenerator`) are not handled — assign those values yourself before inserting.
 
+> [!NOTE]
+> Because bulk insert bypasses the change tracker, no `EntityEntry` is available. Value generators
+> that derive their value from the entry (for example computing an Id from other properties via
+> `entry.Entity`) are not supported and throw a `NotSupportedException`. Use a generator that only
+> produces a value, or assign the value explicitly before inserting.
+
 ## Logging
 
 Bulk insert operations emit EF Core-style logs when a logger factory is configured:

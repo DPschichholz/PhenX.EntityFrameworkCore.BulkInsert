@@ -149,6 +149,11 @@ await dbContext.ExecuteBulkInsertAsync(products);
 Database-generated values and EF Core's implicit generators (such as the default `Guid` key generator
 without an explicit `HasValueGenerator`) are not handled — assign those values yourself before inserting.
 
+> Because bulk insert bypasses the change tracker, no `EntityEntry` is available. Value generators that
+> derive their value from the entry (e.g. computing an Id from other properties via `entry.Entity`) are
+> not supported and throw a `NotSupportedException`; use a generator that only produces a value, or set
+> the value explicitly before inserting.
+
 ### Logging
 
 Bulk insert operations emit EF Core-style logs when a logger factory is configured on the `DbContext` options:

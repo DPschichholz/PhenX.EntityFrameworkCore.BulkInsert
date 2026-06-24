@@ -104,9 +104,23 @@ internal sealed class ColumnMetadata
             return;
         }
 
-        // EntityEntry is intentionally not provided: bulk insert never tracks entities.
-        // Standard value generators (e.g. Guid generators) do not use the entry.
-        var generated = _valueGenerator.Next(null!);
+        // Bulk insert bypasses the change tracker, so there is no real EntityEntry to pass.
+        // Generators that only produce a value (e.g. Guid/sequence generators) ignore the entry
+        // and work fine. Generators that read other properties via the entry are not supported
+        // and surface as a clear NotSupportedException instead of a raw NullReferenceException.
+        object? generated;
+        try
+        {
+            generated = _valueGenerator.Next(null!);
+        }
+        catch (NullReferenceException ex)
+        {
+            throw new NotSupportedException(
+                $"The value generator '{_valueGenerator.GetType().Name}' configured for property " +
+                $"'{PropertyName}' accesses the EntityEntry, which is not available during bulk insert " +
+                "(the change tracker is bypassed). Use a generator that does not rely on the entry, or " +
+                "assign the value explicitly before inserting.", ex);
+        }
 
         // Writing the value back makes repeated reads of the same row stable (some providers
         // read each column more than once) and reflects the generated value on the source entity.
