@@ -317,7 +317,7 @@ internal abstract class SqlDialectBuilder
         if (expr is not ConstantExpression && expr is not ParameterExpression && !ReferencesParameter(expr))
         {
             var value = Expression.Lambda(expr).Compile().DynamicInvoke();
-            return FormatConstant(value, expr.Type);
+            return FormatConstant(value);
         }
 
         switch (expr)
@@ -382,7 +382,7 @@ internal abstract class SqlDialectBuilder
                 }
 
             case ConstantExpression contantExpr:
-                return FormatConstant(contantExpr.Value, contantExpr.Type);
+                return FormatConstant(contantExpr.Value);
 
             case UnaryExpression unaryExpr:
                 if (unaryExpr.NodeType == ExpressionType.Convert)
@@ -460,48 +460,20 @@ internal abstract class SqlDialectBuilder
     /// <summary>
     /// Formats a constant value as an SQL literal.
     /// </summary>
-    private string FormatConstant(object? value, Type type)
+    private string FormatConstant(object? value)
     {
-        var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
-
-        if (value == null)
+        return value switch
         {
-            return "NULL";
-        }
-
-        if (underlyingType == typeof(RawSqlValue))
-        {
-            return ((RawSqlValue)value).Sql;
-        }
-
-        if (value is RawSqlValue rawSqlValue)
-        {
-            return rawSqlValue.Sql;
-        }
-
-        if (underlyingType == typeof(Guid))
-        {
-            return FormatGuid((Guid)value);
-        }
-
-        if (underlyingType == typeof(string))
-        {
-            return $"'{value}'";
-        }
-
-        if (underlyingType == typeof(bool))
-        {
-            return FormatBool((bool)value);
-        }
-
-        // Numeric and other formattable values must use the invariant culture so that, for example,
-        // a decimal is rendered as "42.5" and not the culture-specific "42,5" which is invalid SQL.
-        if (value is IFormattable formattable)
-        {
-            return formattable.ToString(null, CultureInfo.InvariantCulture);
-        }
-
-        return value.ToString() ?? "NULL";
+            null => "NULL",
+            RawSqlValue rawSqlValue => rawSqlValue.Sql,
+            Guid guid => FormatGuid(guid),
+            string s => $"'{s}'",
+            bool b => FormatBool(b),
+            // Numeric and other formattable values must use the invariant culture so that, for example,
+            // a decimal is rendered as "42.5" and not the culture-specific "42,5" which is invalid SQL.
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            _ => value.ToString() ?? "NULL",
+        };
     }
 
     /// <summary>
