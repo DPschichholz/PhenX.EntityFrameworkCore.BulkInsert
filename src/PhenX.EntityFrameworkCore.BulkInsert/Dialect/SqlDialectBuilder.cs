@@ -488,7 +488,7 @@ internal abstract class SqlDialectBuilder
     /// across all supported providers (including Oracle, which has no native SQL boolean type before 23c
     /// and maps <see cref="bool"/> to NUMBER(1)).
     /// </summary>
-    private static string FormatBool(bool value) => value ? "1" : "0";
+    protected virtual string FormatBool(bool value) => value ? "1" : "0";
 
     /// <summary>
     /// Determines whether an expression references any parameter expression, meaning it cannot be
