@@ -378,6 +378,40 @@ public abstract class MergeTestsBase<TDbContext>(IDbContextFactory dbContextFact
     [SkippableTheory]
     [InlineData(InsertStrategy.InsertReturn)]
     [InlineData(InsertStrategy.InsertReturnAsync)]
+    public async Task InsertEntities_WithConflict_UpdateWithStringLiteralContainingSingleQuote(InsertStrategy strategy)
+    {
+        Skip.If(_context.IsProvider(ProviderType.MySql));
+
+        // Arrange - existing row to conflict with (matched on the unique Name column)
+        _context.TestEntities.Add(new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 10 });
+        _context.SaveChanges();
+        _context.ChangeTracker.Clear();
+
+        // A constant string containing a single quote (and backslash) emitted as a literal into the
+        // UPDATE SET clause. Without proper escaping this would either break the statement or allow
+        // SQL injection.
+        const string trickyValue = "O'Brien \\ \"Test\"";
+
+        var entities = new List<TestEntity>
+        {
+            new TestEntity { TestRun = _run, Name = $"{_run}_Entity1", Price = 20 },
+        };
+
+        // Act
+        var insertedEntities = await _context.InsertWithStrategyAsync(strategy, entities, _ => {}, new OnConflictOptions<TestEntity>
+        {
+            Match = e => new { e.Name },
+            Update = (inserted, excluded) => new TestEntity { Name = trickyValue },
+        });
+
+        // Assert - the literal was escaped correctly and round-trips unchanged
+        Assert.Single(insertedEntities);
+        Assert.Equal(trickyValue, insertedEntities[0].Name);
+    }
+
+    [SkippableTheory]
+    [InlineData(InsertStrategy.InsertReturn)]
+    [InlineData(InsertStrategy.InsertReturnAsync)]
     public async Task InsertEntities_WithConflict_UpdateGuidColumn(InsertStrategy strategy)
     {
         Skip.If(_context.IsProvider(ProviderType.MySql));

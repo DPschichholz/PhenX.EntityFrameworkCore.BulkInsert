@@ -1,0 +1,20 @@
+<Project>
+
+    <!--
+      Fork-specific overrides (Dedalus).
+      This file is NOT part of the upstream repository and is loaded by MSBuild
+      after each project's evaluation, so it can safely override SDK defaults
+      without touching any upstream-managed file. This avoids merge conflicts
+      when syncing with upstream.
+
+      Only the NuGet PackageId is changed; AssemblyName, RootNamespace and
+      InternalsVisibleTo remain untouched so internal access and provider->core
+      ProjectReferences keep working.
+    -->
+    <PropertyGroup Label="Dedalus fork package id">
+        <PackageId>$(MSBuildProjectName).Dedalus</PackageId>
+    </PropertyGroup>
+
+</Project>
+
+

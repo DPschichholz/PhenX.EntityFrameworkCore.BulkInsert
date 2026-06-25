@@ -67,4 +67,14 @@ internal class MySqlServerDialectBuilder : SqlDialectBuilder
     {
         return $"VALUES({Quote(columnName)})";
     }
+
+    /// <summary>
+    /// MySQL treats the backslash as an escape character inside string literals (unless the
+    /// <c>NO_BACKSLASH_ESCAPES</c> SQL mode is enabled), so backslashes must be escaped in addition to
+    /// the standard single-quote doubling.
+    /// </summary>
+    protected override string FormatString(string value)
+    {
+        return $"'{value.Replace("\\", "\\\\").Replace("'", "''")}'";
+    }
 }

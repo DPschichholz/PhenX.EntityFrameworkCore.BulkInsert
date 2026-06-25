@@ -477,6 +477,14 @@ internal abstract class SqlDialectBuilder
     }
 
     /// <summary>
+    /// Formats a <see cref="string"/> constant as an SQL literal, escaping embedded single quotes by
+    /// doubling them (<c>'</c> becomes <c>''</c>), which is standard SQL and prevents both broken
+    /// statements and SQL injection. Providers with additional escaping rules (e.g. MySQL's backslash
+    /// escaping) must override this.
+    /// </summary>
+    protected virtual string FormatString(string value) => $"'{value.Replace("'", "''")}'";
+
+    /// <summary>
     /// Formats a <see cref="Guid"/> constant as an SQL literal. The default renders the canonical
     /// dashed string form (valid for providers that store GUIDs as text/uniqueidentifier). Providers
     /// that store GUIDs as binary (e.g. Oracle RAW(16)) must override this.
